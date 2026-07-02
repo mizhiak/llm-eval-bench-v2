@@ -1,0 +1,15 @@
+# 应用框架
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+httpx==0.28.1
+python-multipart==0.0.20
+pydantic==2.10.4
+# 报告导出
+openpyxl==3.1.5
+reportlab==4.4.10
+# 评测引擎（业界标准工具）
+# [app] 含可视化依赖(gradio等)，[perf] 含性能压测依赖，避免离线缺模块
+evalscope[app,perf]
+# evalscope 运行期依赖（部分版本不会自动装全，显式列出避免离线缺失）
+nltk
+modelscope
