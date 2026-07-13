@@ -21,8 +21,89 @@ _FALLBACK = [
     {"name": "gsm8k", "display": "GSM8K（数学推理）", "type": "qa", "lang": "en"},
 ]
 
+# 补充清单：evalscope 已支持但默认 API 不返回的 benchmark
+# 这些都有对应的 adapter，可直接用于评测
+_SUPPLEMENTARY = [
+    # === 代码能力 ===
+    {"name": "humaneval", "display": "HumanEval（代码生成）",
+     "type": "qa", "lang": "en", "subjects": [], "count": 164,
+     "desc": "164 道手写编程题，pass@k 评测"},
+    {"name": "humaneval_plus", "display": "HumanEval+（增强代码测试）",
+     "type": "qa", "lang": "en", "subjects": [], "count": 164,
+     "desc": "HumanEval 增强版，每题 80 个测试用例"},
+    {"name": "mbpp", "display": "MBPP（Python 编程）",
+     "type": "qa", "lang": "en", "subjects": [], "count": 500,
+     "desc": "500 道入门级 Python 编程题"},
+    {"name": "mbpp_plus", "display": "MBPP+（增强 Python 测试）",
+     "type": "qa", "lang": "en", "subjects": [], "count": 500,
+     "desc": "MBPP 增强版，更多测试用例"},
+    {"name": "live_code_bench", "display": "LiveCodeBench（最新代码题）",
+     "type": "qa", "lang": "en", "subjects": [], "count": 0,
+     "desc": "从 LeetCode/AtCoder/CodeForces 收集的最新编程题"},
+    {"name": "multiple_humaneval", "display": "MultiPL-E（多语言代码）",
+     "type": "qa", "lang": "en", "subjects": [], "count": 0,
+     "desc": "HumanEval 翻译为 C++/Java/JS/Go/Rust 等多语言版本"},
+    # === 推理能力 ===
+    {"name": "bbh", "display": "BBH（BIG-Bench Hard 推理）",
+     "type": "qa", "lang": "en", "subjects": [], "count": 6511,
+     "desc": "23 个具挑战性的 BIG-Bench 任务，测试多步推理"},
+    {"name": "hellaswag", "display": "HellaSwag（常识推理）",
+     "type": "mc", "lang": "en", "subjects": [], "count": 10042,
+     "desc": "10042 道完形填空，测试常识推理"},
+    {"name": "winogrande", "display": "WinoGrande（代词消歧）",
+     "type": "mc", "lang": "en", "subjects": [], "count": 1267,
+     "desc": "1267 道代词消歧题，测试常识推理"},
+    {"name": "truthful_qa", "display": "TruthfulQA（真实性评测）",
+     "type": "mc", "lang": "en", "subjects": [], "count": 817,
+     "desc": "817 道测试模型是否输出虚假信息的题目"},
+    {"name": "drop", "display": "DROP（阅读理解+算术）",
+     "type": "qa", "lang": "en", "subjects": [], "count": 9536,
+     "desc": "需要数值推理和阅读理解的 QA 数据集"},
+    # === 数学 ===
+    {"name": "competition_math", "display": "Competition MATH（竞赛数学）",
+     "type": "qa", "lang": "en", "subjects": [], "count": 5000,
+     "desc": "5000 道 AMC/AIME 等竞赛级数学题（含完整解答）"},
+    {"name": "minerva_math", "display": "Minerva-Math（数学推理）",
+     "type": "qa", "lang": "en", "subjects": [], "count": 0,
+     "desc": "使用 Minerva 格式的 MATH 数据集"},
+    {"name": "olympiad_bench", "display": "OlympiadBench（奥赛数学物理）",
+     "type": "qa", "lang": "en", "subjects": [], "count": 0,
+     "desc": "国际奥林匹克数学/物理竞赛题"},
+    # === 知识 ===
+    {"name": "trivia_qa", "display": "TriviaQA（百科问答）",
+     "type": "qa", "lang": "en", "subjects": [], "count": 0,
+     "desc": "大规模百科知识问答"},
+    {"name": "simple_qa", "display": "SimpleQA（事实准确性）",
+     "type": "qa", "lang": "en", "subjects": [], "count": 4326,
+     "desc": "4326 道简单事实问题，测试模型幻觉率"},
+    {"name": "chinese_simpleqa", "display": "Chinese SimpleQA（中文事实准确性）",
+     "type": "qa", "lang": "zh", "subjects": [], "count": 0,
+     "desc": "中文版 SimpleQA，测试中文事实准确性"},
+    # === 长文本 ===
+    {"name": "longbench_v2", "display": "LongBench v2（长文本理解）",
+     "type": "qa", "lang": "en", "subjects": [], "count": 0,
+     "desc": "超长文本理解与推理"},
+    {"name": "needle_haystack", "display": "Needle-in-Haystack（大海捞针）",
+     "type": "qa", "lang": "en", "subjects": [], "count": 0,
+     "desc": "长文本中检索特定信息的压力测试"},
+    # === 生物医学 ===
+    {"name": "pubmedqa", "display": "PubMedQA（生物医学QA）",
+     "type": "mc", "lang": "en", "subjects": [], "count": 1000,
+     "desc": "1000 道基于 PubMed 摘要的生物医学问答"},
+    # === 多语言 ===
+    {"name": "mmlu_redux", "display": "MMLU-Redux（MMLU 修正版）",
+     "type": "mc", "lang": "en", "subjects": [], "count": 0,
+     "desc": "MMLU 错误修正版，修正了原版的标注错误"},
+    {"name": "mmlu_pro", "display": "MMLU-Pro（专业版）",
+     "type": "mc", "lang": "en", "subjects": [], "count": 12032,
+     "desc": "MMLU 进阶版，去除了简单和低质量题目"},
+]
+
 _ZH_HINT = {"ceval", "cmmlu", "cmnli", "iyb", "iquiz", "chinese_simpleqa"}
 _MC_TAGS = {"mcq", "multiple_choice", "choice", "multiplechoice"}
+
+# 确保 supplementary 不会与 API 返回的重复
+_SUPP_NAMES = {d["name"] for d in _SUPPLEMENTARY}
 
 
 def _parse_benchmark(b: dict) -> dict:
@@ -92,6 +173,17 @@ def _cached_catalog_json() -> str:
                             "subjects": [], "count": 0, "desc": "", "builtin": True})
     if not out:
         out = [dict(x, subjects=[], count=0, desc="", builtin=True) for x in _FALLBACK]
+
+    # 合并补充清单（去重：以 API 返回的为准，不重复添加）
+    existing = {d["name"] for d in out}
+    for s in _SUPPLEMENTARY:
+        if s["name"] not in existing:
+            entry = dict(s)
+            entry.setdefault("default_few_shot", 0)
+            entry.setdefault("builtin", True)
+            entry.setdefault("desc", "")
+            out.append(entry)
+
     out.sort(key=lambda d: (0 if d.get("lang") == "zh" else 1, d["name"]))
     return json.dumps(out, ensure_ascii=False)
 

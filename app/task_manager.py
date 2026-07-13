@@ -380,6 +380,22 @@ class TaskManager:
                     pass
         return sorted(seen.values(), key=lambda x: x.get("created") or 0, reverse=True)
 
+    def _trim_logs(self, logs: list, max_logs: int = 500) -> list:
+        """Trim logs to max_logs, preserving important entries."""
+        if len(logs) <= max_logs:
+            return logs
+        important = []
+        regular = []
+        for l in logs:
+            lvl = l.get("level", "") if isinstance(l, dict) else ""
+            msg = l.get("msg", "") if isinstance(l, dict) else str(l)
+            if lvl in ("success", "error", "warn") or "完成" in msg or "失败" in msg or "开始" in msg:
+                important.append(l)
+            else:
+                regular.append(l)
+        result = regular[-(max_logs - len(important)):] + important[-50:]
+        return result[-max_logs:]
+
     def load_detail(self, tid: str) -> dict | None:
         t = self.tasks.get(tid)
         if t:
@@ -396,7 +412,7 @@ class TaskManager:
                 "config": _safe_config(t.config), "result": result,
                 "created": t.created, "finished_at": t.finished_at,
                 "duration": duration,
-                "logs": t.logs, "sweep_levels": t.sweep_levels,
+                "logs": self._trim_logs(t.logs), "sweep_levels": t.sweep_levels,
                 "queue_position": self.get_queue_position(t.id),
             }
         path = os.path.join(DATA_DIR, f"{tid}.json")
@@ -411,6 +427,7 @@ class TaskManager:
                 # 从 raw 字段重提 by_subject/by_category（修复旧版数据）
                 from app.evalscope_client import renormalize_stored_result
                 renormalize_stored_result(d.get("result"))
+                d["logs"] = self._trim_logs(d.get("logs") or [])
                 return d
             except Exception:
                 return None

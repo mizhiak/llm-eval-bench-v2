@@ -16,6 +16,65 @@ import threading
 import tempfile
 
 from app import evalscope_client as es
+# Realistic Chinese seed for perf test prompts. Uses diverse vocabulary and
+# sentence structures to produce realistic token distributions.
+_REALISTIC_PROMPT_SEED = (
+    "人工智能技术近年来取得了突破性进展，深度学习模型在自然语言处理、计算机视觉、语音识别等领域展现出强大的能力。"
+    "从早期的感知机到如今的Transformer架构，神经网络的发展经历了多次范式转变。大规模预训练模型如GPT、BERT、LLaMA等，"
+    "通过在海量文本数据上进行自监督学习，获得了丰富的语言理解和生成能力。这些模型不仅在学术界引起了广泛关注，"
+    "也在工业界得到了广泛应用，包括智能客服、代码生成、内容创作、医疗诊断辅助等多个场景。"
+    "在实际部署中，模型推理性能成为关键瓶颈。大语言模型的参数量动辄数十亿甚至数千亿，单次推理需要消耗大量的计算资源和内存带宽。"
+    "为了提升服务吞吐量，业界提出了多种优化方案：KV缓存技术通过缓存已计算的键值对来避免重复计算；"
+    "连续批处理策略允许将多个请求动态合并处理；量化技术通过降低数值精度来减少计算和存储开销；"
+    "投机采样利用小模型预测大模型输出以加速生成；FlashAttention通过优化内存访问模式显著提升注意力计算效率。"
+    "在分布式推理方面，张量并行、流水线并行、数据并行等策略各有优劣。张量并行将单个Transformer层的参数切分到多张GPU上，"
+    "通信开销较大但延迟低；流水线并行将不同层分配到不同设备，适合超大规模模型但可能产生流水线气泡；"
+    "数据并行则通过复制模型实例来处理更多并发请求，实现简单的水平扩展。实际系统往往综合运用多种并行策略。"
+    "服务系统的调度策略也至关重要。请求到达率、服务时间分布、排队策略等因素共同决定了系统的整体表现。"
+    "常见的调度算法包括先到先服务、最短作业优先、轮询调度等。对于大模型推理服务，还需要考虑抢占式调度、"
+    "优先级队列等机制来平衡延迟和吞吐。当并发请求数超过系统容量时，排队延迟会急剧增长，需要通过限流、降级等策略来保障服务质量。"
+    "在工程实践中，监控和可观测性同样不可或缺。需要采集请求延迟分布、吞吐量、错误率、GPU利用率、显存占用等关键指标，"
+    "通过仪表盘和告警规则及时发现性能瓶颈和异常情况。分布式追踪技术可以帮助分析请求在微服务调用链中的耗时分布。"
+    "性能测试是评估系统能力的重要手段。通过构造不同并发量、不同输入输出长度的负载场景，可以绘制系统的吞吐-延迟曲线，"
+    "找到最佳工作点和性能拐点。压力测试可以验证系统在极限负载下的稳定性。长稳测试则关注系统长期运行的内存泄漏和性能衰减问题。"
+    "容量规划需要综合考虑业务增长预期、硬件成本、能效比等因素，确定合适的基础设施规模和扩展策略。"
+    "除了性能之外，模型的安全性、公平性、可解释性等问题也日益受到重视。红队测试、对抗攻击检测、偏见评估等措施"
+    "有助于构建负责任的人工智能系统。随着各国AI监管法规的陆续出台，合规性也成为企业部署AI系统时必须考虑的因素。"
+    "未来，随着模型架构的持续演进和硬件性能的不断提升，大模型推理服务的效率还将进一步提高。稀疏注意力、混合专家模型、"
+    "状态空间模型等新技术路线正在积极探索中，有望在保持模型质量的同时大幅降低推理成本。"
+    "在数据库领域，关系型数据库如MySQL和PostgreSQL依然占据主导地位，但NoSQL数据库如MongoDB、Redis、Cassandra等"
+    "也在各自的适用场景中发挥着重要作用。图数据库如Neo4j适合处理社交网络和推荐系统等图结构数据。"
+    "时序数据库如InfluxDB和TimescaleDB专为物联网监控和金融交易等时间序列场景优化。"
+    "分布式系统设计中的CAP定理指出，一致性、可用性和分区容错性三者最多只能同时满足两个。"
+    "在实际工程中，BASE理论（基本可用、软状态、最终一致性）为很多互联网系统提供了更实用的设计指导。"
+    "微服务架构虽然带来了独立部署和团队自治的好处，但也引入了服务发现、负载均衡、熔断降级、分布式事务等新的复杂性。"
+    "容器化技术如Docker和编排系统如Kubernetes已经成为云原生应用的标准基础设施。"
+    "网络协议方面，HTTP/3基于QUIC协议，通过减少连接建立时间和改进丢包恢复机制，显著提升了网页加载速度。"
+    "WebSocket协议为实时通信场景提供了全双工通道，而gRPC则以其高效的二进制序列化和流式传输能力在微服务通信中广泛使用。"
+    "前端开发领域，React、Vue、Angular三大框架各有拥趸。React的虚拟DOM和函数式编程范式深刻影响了现代前端开发方式。"
+    "TypeScript通过引入静态类型检查，大幅提升了大型前端项目的可维护性和开发效率。"
+    "编程语言方面，Rust以其零成本抽象和内存安全保证在系统编程领域迅速崛起，被用于构建操作系统、浏览器引擎、区块链等底层软件。"
+    "Go语言以其简洁的语法、高效的并发模型和快速的编译速度，成为云原生基础设施开发的主流选择。"
+    "Python凭借其丰富的科学计算和机器学习生态，持续主导着数据科学和人工智能领域。"
+    "计算机科学的基础理论依然重要：数据结构和算法是程序设计的基石，操作系统原理指导着资源管理和调度策略，"
+    "计算机网络原理支撑着分布式系统的通信设计，编译原理则帮助理解从高级语言到机器码的转换过程。"
+    "软件工程的最佳实践包括代码审查、持续集成和持续部署、自动化测试、基础设施即代码等。"
+    "敏捷开发方法如Scrum和Kanban强调迭代交付和持续反馈，而DevOps文化则致力于打破开发和运维之间的壁垒。"
+    "安全是软件系统不可忽视的横切关注点。常见的安全威胁包括SQL注入、跨站脚本攻击、跨站请求伪造、服务端请求伪造等。"
+    "OWASP Top 10项目持续跟踪最关键的Web应用安全风险。零信任安全模型已经成为现代企业安全架构的主流理念。"
+    "数据加密技术如AES、RSA、TLS等为数据传输和存储提供机密性保护，而哈希算法如SHA-256则为数据完整性提供校验。"
+    "身份认证和授权机制是实现安全访问控制的基础。OAuth 2.0和OpenID Connect是当前最流行的认证授权协议。"
+)
+
+
+def _build_realistic_prompt(target_tokens):
+    if target_tokens <= 0:
+        return "请用大约200字介绍一下人工智能的发展历史。"
+    chars_per_token = 1.5
+    repeats = max(1, int(target_tokens * chars_per_token / len(_REALISTIC_PROMPT_SEED)) + 1)
+    full_text = (_REALISTIC_PROMPT_SEED * repeats)[:int(target_tokens * chars_per_token)]
+    return full_text
+
 
 # 映射 app_task_id → evalscope_task_id，用于 stop 级联
 _eval_task_map: dict[str, str] = {}
@@ -44,6 +103,10 @@ def run_accuracy_evalscope(task, cfg: dict, summary: dict):
     few_shot = cfg.get("few_shot", 0) or 0
     max_tokens = cfg.get("acc_max_tokens") or 2048
     temperature = cfg.get("acc_temperature", 0.0)
+    acc_concurrency = cfg.get("acc_concurrency", 1) or 1
+    acc_stream = cfg.get("acc_stream", True)
+    disable_thinking = cfg.get("disable_thinking", False)
+    req_timeout = cfg.get("timeout") or None  # request-level timeout
 
     if not es.health():
         task.log("error", "evalscope service 未就绪（默认 9000 端口）。"
@@ -53,6 +116,15 @@ def run_accuracy_evalscope(task, cfg: dict, summary: dict):
     # 准备 evalscope 的 datasets 列表与 dataset_args
     es_datasets = list(builtin)
     dataset_args = {}
+    # 用户未显式设置 few_shot 时，使用数据集默认值（对标官方榜单）
+    user_few_shot = cfg.get("few_shot", 0) or 0
+    if user_few_shot == 0:
+        from app.evalscope_catalog import catalog_list
+        catalog = {d["name"]: d for d in catalog_list()}
+        for ds in builtin:
+            ds_default = catalog.get(ds, {}).get("default_few_shot", 0)
+            if ds_default > 0:
+                dataset_args.setdefault(ds, {})["few_shot_num"] = ds_default
     subj_sel = cfg.get("dataset_subjects", {}) or {}
     for ds in builtin:
         subs = subj_sel.get(ds)
@@ -75,7 +147,16 @@ def run_accuracy_evalscope(task, cfg: dict, summary: dict):
                             f"（subset: {da['subset_list'][0]}）")
 
     ds_label = "、".join(es_datasets)
-    shot_label = f"{few_shot}-shot" if few_shot > 0 else "0-shot"
+    # 计算实际生效的 few_shot
+    actual_few_shot = user_few_shot
+    for ds in builtin:
+        fsn = dataset_args.get(ds, {}).get("few_shot_num")
+        if fsn:
+            actual_few_shot = int(fsn)
+            break
+    shot_label = f"{actual_few_shot}-shot" if actual_few_shot > 0 else "0-shot"
+    if user_few_shot == 0 and actual_few_shot > 0:
+        shot_label += "（数据集默认）"
     task.log("info", f"━━ 精度评测启动（evalscope）━━ 数据集：{ds_label}")
     task.log("info", f"   评测参数：{shot_label} | max_tokens {max_tokens} | "
                      f"temperature {temperature}"
@@ -93,7 +174,12 @@ def run_accuracy_evalscope(task, cfg: dict, summary: dict):
                 model=model, api_url=api_url, api_key=api_key,
                 datasets=es_datasets, limit=limit, few_shot=few_shot,
                 max_tokens=max_tokens, temperature=temperature,
-                dataset_args=dataset_args or None, task_id=eval_task_id)
+                dataset_args=dataset_args or None, task_id=eval_task_id,
+                eval_batch_size=acc_concurrency,
+                stream=acc_stream,
+                disable_thinking=disable_thinking,
+                request_timeout=req_timeout,
+                timeout=None)
         except Exception as e:
             holder["error"] = e
         finally:
@@ -221,7 +307,7 @@ def run_performance_evalscope(task, cfg: dict, summary: dict):
     if context_length > 0:
         # 用重复字符近似目标 token 数（中文字符约 1.5 tokens/字）
         approx_chars = int(context_length / 1.5)
-        prompt_text = "测" * approx_chars
+        prompt_text = _build_realistic_prompt(context_length)
         ctx_label = f" | 长上下文输入 ~{context_length} tokens（近似）"
     else:
         ctx_label = ""
@@ -309,7 +395,7 @@ def run_performance_evalscope(task, cfg: dict, summary: dict):
         raise holder["error"]
 
     raw = holder["result"] or {}
-    result = es.normalize_perf_result(raw)
+    result = es.normalize_perf_result(raw, max_tokens=max_tokens)
     result["profile"] = {
         "levels": levels,
         "requests_per_level": req_per_level,
@@ -379,7 +465,7 @@ def run_context_scan(task, cfg: dict, summary: dict):
 
         # 生成临时数据集：用重复字符近似目标 token 数
         approx_chars = max(1, int(ctx_len / 1.5))
-        prompt_line = "测" * approx_chars
+        prompt_line = _build_realistic_prompt(ctx_len)
         tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False, encoding="utf-8")
         for _ in range(requests):
             tmp.write(json.dumps(prompt_line, ensure_ascii=False) + "\n")
@@ -427,7 +513,7 @@ def run_context_scan(task, cfg: dict, summary: dict):
             task.log("error", f"   上下文 {ctx_len} 压测失败：{holder['error']}")
             scan_results[f"context_{ctx_len}"] = {"context_length": ctx_len, "error": str(holder["error"])}
         else:
-            norm = es.normalize_perf_result(holder["result"] or {})
+            norm = es.normalize_perf_result(holder["result"] or {}, max_tokens=max_tokens)
             sweep = norm.get("sweep", [])
             metric = sweep[0] if sweep else {}
             scan_results[f"context_{ctx_len}"] = {

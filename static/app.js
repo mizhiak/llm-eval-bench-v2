@@ -359,7 +359,7 @@ function buildConfig() {
       temperature: parseFloat($("#perfTemperature").value) || 0,
       system: $("#perfSystem").value.trim(),
       timeout: parseFloat($("#perfTimeout").value) || 300,
-      warmup_requests: parseInt($("#perfWarmup").value) || 0,
+      warmup_requests: parseFloat($("#perfWarmup").value) || 0,
     },
     // Context scan independent params
     context_lengths: $("#runCtxScan").checked ? parseLevels($("#ctxLengths").value) : [],
@@ -571,8 +571,8 @@ $("#btnStart").addEventListener("click", async () => {
   if (cfg.accuracy_datasets.length === 0 && !cfg.run_performance) {
     alert("请至少选择一个精度数据集，或开启性能压测"); return;
   }
-  if (!["openai", "vllm"].includes(cfg.api_format)) {
-    alert("正式评测/压测仅支持 OpenAI 兼容接口。Ollama 原生和 Completions 可用于连通性测试，但不能直接进入 evalscope。");
+  if (!["openai", "vllm", "anthropic"].includes(cfg.api_format)) {
+    alert("正式评测/压测仅支持 OpenAI 兼容 / Anthropic 接口。Ollama 原生和 Completions 可用于连通性测试，但不能直接进入 evalscope。");
     return;
   }
   // reset
@@ -1191,8 +1191,9 @@ function renderPerf(p) {
       r.concurrency === best.concurrency ? "best-row" : "",
       r.success_rate != null && r.success_rate < 99 ? "risk-row" : "",
     ].filter(Boolean).join(" ");
-    return `<tr${rowCls ? ` class="${rowCls}"` : ""}>
-    <td>${r.concurrency}</td>
+    const degradCls = r.degraded ? " degrad-row" : "";
+    return `<tr class="${rowCls}${degradCls}"${!rowCls && !degradCls ? "" : ""}>
+    <td>${r.concurrency}${r.degraded ? ` <span class="degrad-tag" title="成功率显示100%，但${r.degraded_pct}%的请求返回了短/空响应（平均输出仅${r.avg_out_tokens}token）">⚠退化</span>` : ""}</td>
     <td>${fmtMetric(r.rps)}</td>
     ${hasTotalTps ? `<td>${fmtMetric(r.total_tps)}</td>` : ""}
     <td>${fmtMetric(r.output_tps)}</td>
@@ -1206,7 +1207,7 @@ function renderPerf(p) {
     ${hasMax ? `<td>${fmtMetric(r.latency_max)}s</td>` : ""}
     ${hasTtft ? `<td>${r.ttft_avg != null ? fmtMetric(r.ttft_avg) + "s" : "-"}</td>` : ""}
     ${hasTtft ? `<td>${r.ttft_p99 != null ? fmtMetric(r.ttft_p99) + "s" : "-"}</td>` : ""}
-    <td>${r.avg_in_tokens || "-"}</td><td>${r.avg_out_tokens || "-"}</td>
+    <td>${r.avg_in_tokens || "-"}</td><td class="${r.degraded ? 'degrad-cell' : ''}">${r.avg_out_tokens || "-"}${r.degraded ? ` <span class="degrad-pct">(${r.degraded_pct}%退化)</span>` : ""}</td>
     <td>${r.success_rate != null ? r.success_rate + "%" : "-"}</td></tr>`;
   }).join("");
 
@@ -1227,7 +1228,7 @@ function renderPerf(p) {
   }
 
   const warnHtml = warnings.length ? `<div class="perf-warnings">
-    ${warnings.map(w => `<div class="diag-warn"><b>${esc(w.title || "风险提示")}</b>${esc(w.message || "")}</div>`).join("")}
+    ${warnings.map(w => typeof w === "string" ? `<div class="diag-warn">${esc(w)}</div>` : `<div class="diag-warn"><b>${esc(w.title || "风险提示")}</b>${esc(w.message || "")}</div>`).join("")}
   </div>` : "";
   const profileHtml = Object.keys(profile).length ? `<details class="metric-guide">
     <summary>压测配置快照（点击展开）</summary>
@@ -1245,6 +1246,25 @@ function renderPerf(p) {
     </div>
   </details>` : "";
 
+  const ttftHtml = ttftChart(rows) ? `<div class="result-block">
+      <h3>TTFT 首 Token 延迟
+        <span class="best-tag">交互体验核心指标</span>
+      </h3>
+      ${ttftChart(rows)}
+    </div>` : "";
+  const tpsHtml = tpsChart(rows) ? `<div class="result-block">
+      <h3>Token 吞吐量
+        <span class="best-tag">每秒处理 token 数</span>
+      </h3>
+      ${tpsChart(rows)}
+    </div>` : "";
+  const latencyHtml = latencySpreadChart(rows) ? `<div class="result-block">
+      <h3>延迟分位数分布
+        <span class="best-tag">P50 / P90 / P99 / Max 随并发的扩散</span>
+      </h3>
+      ${latencySpreadChart(rows)}
+    </div>` : "";
+
   root.innerHTML = `
     <div class="result-block">
       <h3>各档位性能摘要</h3>
@@ -1256,6 +1276,9 @@ function renderPerf(p) {
       </h3>
       ${chart}
     </div>
+    ${ttftHtml}
+    ${tpsHtml}
+    ${latencyHtml}
     ${warnHtml}
     ${recHtml}
     <div class="result-block">
@@ -1436,6 +1459,175 @@ function sweepChart(rows) {
     </svg>`;
 }
 
+// ── TTFT 曲线：首 token 延迟 avg + P99 vs 并发 ──
+function ttftChart(rows) {
+  const W = 720, H = 260, padL = 52, padR = 52, padT = 24, padB = 44;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  const valid = rows.filter(r => r.ttft_avg != null);
+  if (!valid.length) return "";
+  const xs = valid.map(r => r.concurrency);
+  const maxX = Math.max(...xs), minX = Math.min(...xs);
+  const maxTtft = Math.max(...valid.map(r => r.ttft_p99 || r.ttft_avg || 0), 0.1);
+
+  const xPos = x => padL + (maxX === minX ? plotW / 2 : (x - minX) / (maxX - minX) * plotW);
+  const yVal = v => padT + plotH - (v / maxTtft) * plotH;
+
+  const line = (pts, color, w) =>
+    '<polyline points="' + pts.map(p => p.join(",")).join(" ") + '" fill="none" stroke="' + color + '" stroke-width="' + w + '" stroke-linecap="round" stroke-linejoin="round"/>';
+  const dots = (pts, color) => pts.map(p =>
+    '<circle cx="' + p[0] + '" cy="' + p[1] + '" r="3.5" fill="' + color + '" stroke="#0d1220" stroke-width="1.5"/>').join("");
+
+  const ttftPts = valid.map(r => [xPos(r.concurrency), yVal(r.ttft_avg || 0)]);
+  const ttftP99Pts = valid.map(r => [xPos(r.concurrency), yVal(r.ttft_p99 || r.ttft_avg || 0)]);
+
+  let grid = "";
+  for (let i = 0; i <= 4; i++) {
+    const y = padT + (plotH / 4) * i;
+    grid += '<line x1="' + padL + '" y1="' + y + '" x2="' + (W - padR) + '" y2="' + y + '" stroke="#222c44" stroke-width="1"/>';
+    grid += '<text x="' + (padL - 8) + '" y="' + (y + 4) + '" text-anchor="end" fill="#8b96b0" font-size="9" font-family="monospace">' + (maxTtft * (1 - i / 4)).toFixed(2) + 's</text>';
+  }
+  let xlabels = valid.map(r =>
+    '<text x="' + xPos(r.concurrency) + '" y="' + (H - padB + 18) + '" text-anchor="middle" fill="#8b96b0" font-size="10" font-family="monospace">' + r.concurrency + '</text>').join("");
+
+  return '<div class="chart-legend">'
+    + '<span class="lg"><i style="background:#f59e0b"></i>TTFT avg</span>'
+    + '<span class="lg"><i style="background:#ef4444"></i>TTFT P99</span>'
+    + '</div>'
+    + '<svg viewBox="0 0 ' + W + ' ' + H + '" class="sweep-svg" xmlns="http://www.w3.org/2000/svg">'
+    + grid
+    + line(ttftP99Pts, "#ef4444", 1.8)
+    + line(ttftPts, "#f59e0b", 2.4)
+    + dots(ttftP99Pts, "#ef4444")
+    + dots(ttftPts, "#f59e0b")
+    + xlabels
+    + '<text x="' + (W / 2) + '" y="' + (H - 6) + '" text-anchor="middle" fill="#5a6685" font-size="11" font-family="monospace">并发数</text>'
+    + '</svg>';
+}
+
+// ── Token 吞吐曲线：输出/总/输入 tok/s vs 并发 ──
+function tpsChart(rows) {
+  const W = 720, H = 260, padL = 52, padR = 52, padT = 24, padB = 44;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  const valid = rows.filter(r => r.output_tps != null);
+  if (!valid.length) return "";
+  const xs = valid.map(r => r.concurrency);
+  const maxX = Math.max(...xs), minX = Math.min(...xs);
+  const hasTotal = valid.some(r => r.total_tps != null);
+  const hasInput = valid.some(r => r.input_tps != null && r.input_tps > 0);
+  const maxTps = Math.max(
+    ...valid.map(r => Math.max(r.output_tps || 0, r.total_tps || 0, r.input_tps || 0)), 0.1
+  );
+
+  const xPos = x => padL + (maxX === minX ? plotW / 2 : (x - minX) / (maxX - minX) * plotW);
+  const yVal = v => padT + plotH - (v / maxTps) * plotH;
+
+  const line = (pts, color, w) =>
+    '<polyline points="' + pts.map(p => p.join(",")).join(" ") + '" fill="none" stroke="' + color + '" stroke-width="' + w + '" stroke-linecap="round" stroke-linejoin="round"/>';
+  const dots = (pts, color) => pts.map(p =>
+    '<circle cx="' + p[0] + '" cy="' + p[1] + '" r="3.5" fill="' + color + '" stroke="#0d1220" stroke-width="1.5"/>').join("");
+
+  const outPts = valid.map(r => [xPos(r.concurrency), yVal(r.output_tps || 0)]);
+  const totalPts = hasTotal ? valid.map(r => [xPos(r.concurrency), yVal(r.total_tps || 0)]) : [];
+  const inPts = hasInput ? valid.map(r => [xPos(r.concurrency), yVal(r.input_tps || 0)]) : [];
+
+  let grid = "";
+  for (let i = 0; i <= 4; i++) {
+    const y = padT + (plotH / 4) * i;
+    grid += '<line x1="' + padL + '" y1="' + y + '" x2="' + (W - padR) + '" y2="' + y + '" stroke="#222c44" stroke-width="1"/>';
+    grid += '<text x="' + (padL - 8) + '" y="' + (y + 4) + '" text-anchor="end" fill="#8b96b0" font-size="9" font-family="monospace">' + fmtMetric(maxTps * (1 - i / 4)) + '</text>';
+  }
+  let xlabels = valid.map(r =>
+    '<text x="' + xPos(r.concurrency) + '" y="' + (H - padB + 18) + '" text-anchor="middle" fill="#8b96b0" font-size="10" font-family="monospace">' + r.concurrency + '</text>').join("");
+
+  let legend = '<span class="lg"><i style="background:#22d3ee"></i>输出 tok/s</span>';
+  let lines = line(outPts, "#22d3ee", 2.4);
+  let dotsHtml = dots(outPts, "#22d3ee");
+  if (hasTotal) {
+    legend += '<span class="lg"><i style="background:#a78bfa"></i>总 tok/s</span>';
+    lines += line(totalPts, "#a78bfa", 1.8);
+    dotsHtml += dots(totalPts, "#a78bfa");
+  }
+  if (hasInput) {
+    legend += '<span class="lg"><i style="background:#34d399"></i>输入 tok/s</span>';
+    lines += line(inPts, "#34d399", 1.8);
+    dotsHtml += dots(inPts, "#34d399");
+  }
+
+  return '<div class="chart-legend">' + legend + '</div>'
+    + '<svg viewBox="0 0 ' + W + ' ' + H + '" class="sweep-svg" xmlns="http://www.w3.org/2000/svg">'
+    + grid
+    + lines
+    + dotsHtml
+    + xlabels
+    + '<text x="' + (W / 2) + '" y="' + (H - 6) + '" text-anchor="middle" fill="#5a6685" font-size="11" font-family="monospace">并发数</text>'
+    + '</svg>';
+}
+
+// ── 延迟分位数分布：P50 / P90 / P99 / Max vs 并发 ──
+function latencySpreadChart(rows) {
+  const W = 720, H = 260, padL = 52, padR = 52, padT = 24, padB = 44;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  const valid = rows.filter(r => r.latency_avg != null);
+  if (!valid.length) return "";
+  const xs = valid.map(r => r.concurrency);
+  const maxX = Math.max(...xs), minX = Math.min(...xs);
+  const hasP50 = valid.some(r => r.latency_p50 != null);
+  const hasMax = valid.some(r => r.latency_max != null);
+  const maxLat = Math.max(
+    ...valid.map(r => Math.max(r.latency_max || 0, r.latency_p99 || 0, r.latency_p90 || 0, r.latency_avg || 0)), 0.1
+  );
+
+  const xPos = x => padL + (maxX === minX ? plotW / 2 : (x - minX) / (maxX - minX) * plotW);
+  const yVal = v => padT + plotH - (v / maxLat) * plotH;
+
+  const line = (pts, color, w, dash) =>
+    '<polyline points="' + pts.map(p => p.join(",")).join(" ") + '" fill="none" stroke="' + color + '" stroke-width="' + w + '" stroke-linecap="round" stroke-linejoin="round"' + (dash ? ' stroke-dasharray="' + dash + '"' : '') + '/>';
+  const dots = (pts, color) => pts.map(p =>
+    '<circle cx="' + p[0] + '" cy="' + p[1] + '" r="3" fill="' + color + '" stroke="#0d1220" stroke-width="1"/>').join("");
+
+  const p50Pts = hasP50 ? valid.map(r => [xPos(r.concurrency), yVal(r.latency_p50 || 0)]) : [];
+  const p90Pts = valid.map(r => [xPos(r.concurrency), yVal(r.latency_p90 || 0)]);
+  const p99Pts = valid.map(r => [xPos(r.concurrency), yVal(r.latency_p99 || 0)]);
+  const maxPts = hasMax ? valid.map(r => [xPos(r.concurrency), yVal(r.latency_max || 0)]) : [];
+
+  let grid = "";
+  for (let i = 0; i <= 4; i++) {
+    const y = padT + (plotH / 4) * i;
+    grid += '<line x1="' + padL + '" y1="' + y + '" x2="' + (W - padR) + '" y2="' + y + '" stroke="#222c44" stroke-width="1"/>';
+    grid += '<text x="' + (padL - 8) + '" y="' + (y + 4) + '" text-anchor="end" fill="#8b96b0" font-size="9" font-family="monospace">' + (maxLat * (1 - i / 4)).toFixed(2) + 's</text>';
+  }
+  let xlabels = valid.map(r =>
+    '<text x="' + xPos(r.concurrency) + '" y="' + (H - padB + 18) + '" text-anchor="middle" fill="#8b96b0" font-size="10" font-family="monospace">' + r.concurrency + '</text>').join("");
+
+  let legend = '<span class="lg"><i style="background:#22d3ee"></i>P50</span>'
+    + '<span class="lg"><i style="background:#6366f1"></i>P90</span>'
+    + '<span class="lg"><i style="background:#fb7185"></i>P99</span>';
+  let lines = '';
+  let dotsHtml = '';
+  if (hasP50) {
+    lines += line(p50Pts, "#22d3ee", 1.5, "4,4");
+    dotsHtml += dots(p50Pts, "#22d3ee");
+  }
+  lines += line(p90Pts, "#6366f1", 2);
+  lines += line(p99Pts, "#fb7185", 2.4);
+  dotsHtml += dots(p90Pts, "#6366f1");
+  dotsHtml += dots(p99Pts, "#fb7185");
+  if (hasMax) {
+    legend += '<span class="lg"><i style="background:#ef4444"></i>Max</span>';
+    lines += line(maxPts, "#ef4444", 1.2, "2,3");
+    dotsHtml += dots(maxPts, "#ef4444");
+  }
+
+  return '<div class="chart-legend">' + legend + '</div>'
+    + '<svg viewBox="0 0 ' + W + ' ' + H + '" class="sweep-svg" xmlns="http://www.w3.org/2000/svg">'
+    + grid
+    + lines
+    + dotsHtml
+    + xlabels
+    + '<text x="' + (W / 2) + '" y="' + (H - 6) + '" text-anchor="middle" fill="#5a6685" font-size="11" font-family="monospace">并发数</text>'
+    + '</svg>';
+}
+
 // HSL 色阶：0=红 → 50=黄 → 100=绿
 function scoreColor(score) {
   const v = Math.max(0, Math.min(100, Number(score) || 0));
@@ -1470,6 +1662,84 @@ function fmtMetric(n) {
   if (Math.abs(v) >= 10) return v.toFixed(2);
   return v.toFixed(3).replace(/0+$/, "").replace(/\.$/, "");
 }
+
+// ============ 性能测试预设 ============
+// 性能测试预设 — 对齐 evalscope perf 标准 (number=1000 为 evalscope 默认)
+// warmup 支持 ratio 模式：0.05 = 5% 预热，传 evalscope warmup_num 自动识别
+// sleep_interval 默认 5s (evalscope 内置，档位间自动间隔)
+const PERF_PRESETS = {
+  sweep: {
+    label: "标准 Sweep",
+    levels: "1,5,10,50,100",
+    scaleMode: false,
+    scaleMult: 10,
+    maxTokens: 1024,
+    minTokens: 1024,
+    contextLength: 2048,
+    timeout: 600,
+    warmup: 0.05,
+    stream: "true",
+    temperature: 0,
+    hint: "evalscope 标准：并发 1/5/10/50/100 · 每档 1000 请求 · 5% 预热 · 2K入1K出 · 档间 5s 间隔",
+  },
+  quick: {
+    label: "快速压测",
+    levels: "1,5,10",
+    scaleMode: false,
+    scaleMult: 10,
+    maxTokens: 256,
+    minTokens: 0,
+    contextLength: 0,
+    timeout: 120,
+    warmup: 0,
+    stream: "true",
+    temperature: 0,
+    hint: "evalscope 快速验证：并发 1/5/10 · 每档 200 请求 · 无预热 · 短输入 · 约 60s 完成",
+  },
+  stress: {
+    label: "极限压测",
+    levels: "50,100,200",
+    scaleMode: false,
+    scaleMult: 10,
+    maxTokens: 512,
+    minTokens: 0,
+    contextLength: 0,
+    timeout: 600,
+    warmup: 0.05,
+    stream: "true",
+    temperature: 0,
+    hint: "evalscope 高压：并发 50/100/200 · 每档 1000 请求 · 5% 预热 · 短输入 · 档间 5s 间隔",
+  },
+};
+
+function applyPerfPreset(key) {
+  const p = PERF_PRESETS[key];
+  if (!p) return;
+  $("#sweepLevels").value = p.levels;
+  $("#perfScaleMode").checked = p.scaleMode;
+  $("#perfScaleMult").value = p.scaleMult;
+  $("#perfMaxTokens").value = p.maxTokens;
+  $("#perfMinTokens").value = p.minTokens;
+  $("#contextLength").value = p.contextLength;
+  $("#perfTimeout").value = p.timeout;
+  $("#perfWarmup").value = p.warmup;
+  $("#perfStream").value = p.stream;
+  $("#perfTemperature").value = p.temperature;
+  // Update scale UI visibility
+  updatePerfScalePreview();
+  updateConfigSummaries();
+  // Highlight active preset
+  $$(".perf-preset").forEach(btn => {
+    btn.classList.toggle("active", btn.dataset.preset === key);
+  });
+  // Show hint
+  const hintEl = document.getElementById("perfPresetHint");
+  if (hintEl) hintEl.textContent = p.hint;
+}
+
+$$(".perf-preset").forEach(btn => {
+  btn.addEventListener("click", () => applyPerfPreset(btn.dataset.preset));
+});
 
 // ============ 推荐参数预设 ============
 const PRESETS = {
@@ -1658,6 +1928,8 @@ function taskCard(t) {
 
 async function viewTask(id) {
   try {
+    // 查看历史记录时，断开与实时 SSE 流的关联，避免实时日志覆盖历史数据
+    currentTaskId = null;
     const r = await fetch("/api/tasks/" + id);
     const d = await r.json();
     _reviewTaskId = id;  // enable review viewer

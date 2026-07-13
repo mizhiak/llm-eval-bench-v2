@@ -181,7 +181,10 @@ def get_perf_log(task_id: str, tail_lines: int = 100) -> dict | None:
 def run_eval(model: str, api_url: str, api_key: str, datasets: list[str],
              limit: int = 0, few_shot: int = 0, max_tokens: int = 2048,
              temperature: float = 0.0, dataset_args: dict | None = None,
-             timeout: float = 7200, task_id: str = None) -> dict:
+             timeout: float = 7200, task_id: str = None,
+             eval_batch_size: int = 1, stream: bool = True,
+             disable_thinking: bool = False,
+             request_timeout: float = None) -> dict:
     """调用 evalscope 精度评测。
 
     datasets: evalscope 数据集名，如 ['ceval','mmlu','gsm8k','cmmlu']
@@ -189,7 +192,7 @@ def run_eval(model: str, api_url: str, api_key: str, datasets: list[str],
     task_id: 如果提供，传给 evalscope 用于 progress/log/stop 关联
     返回 evalscope 的评测结果 JSON。
     """
-    gen_cfg = {"max_tokens": max_tokens, "temperature": temperature}
+    gen_cfg = {"max_tokens": max_tokens, "temperature": temperature, "stream": stream}
     payload = {
         "model": model,
         "api_url": api_url,
@@ -198,8 +201,12 @@ def run_eval(model: str, api_url: str, api_key: str, datasets: list[str],
         "datasets": datasets,
         "generation_config": gen_cfg,
     }
+    if disable_thinking:
+        gen_cfg["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
     if limit and limit > 0:
         payload["limit"] = limit
+    if eval_batch_size and eval_batch_size > 1:
+        payload["eval_batch_size"] = eval_batch_size
     # few-shot 与子集通过 dataset_args 传给 evalscope
     da = dict(dataset_args or {})
     if few_shot and few_shot > 0:
@@ -208,6 +215,8 @@ def run_eval(model: str, api_url: str, api_key: str, datasets: list[str],
             da.setdefault(ds, {})["few_shot_num"] = few_shot
     if da:
         payload["dataset_args"] = da
+    if request_timeout is not None:
+        payload["timeout"] = request_timeout
     tid = task_id or uuid.uuid4().hex[:12]
     return _post("/api/v1/eval/invoke", payload, timeout=timeout, task_id=tid)
 
@@ -251,7 +260,7 @@ def run_perf(model: str, url: str, api_key: str, parallel, number,
     if request_timeout is not None:
         payload["request_timeout"] = request_timeout
     if warmup_requests > 0:
-        payload["warmup_requests"] = warmup_requests
+        payload["warmup_num"] = warmup_requests  # evalscope field: warmup_num (>=1=absolute, <1=ratio)
     if dataset == "random":
         # random 数据集需指定 token 长度范围与 tokenizer
         payload["prefix_length"] = prefix_length
@@ -490,7 +499,7 @@ def renormalize_stored_result(result: dict) -> dict:
     return result
 
 
-def normalize_perf_result(raw: dict) -> dict:
+def normalize_perf_result(raw: dict, max_tokens: int = None) -> dict:
     """把 evalscope perf 结果转换成我们的 sweep 结构（曲线+明细+推荐）。
 
     evalscope perf 真实响应格式：
@@ -550,8 +559,8 @@ def normalize_perf_result(raw: dict) -> dict:
             "latency_p90": _num(pct_map.get("90%") or _pick(metrics, "P90 latency (s)")),
             "latency_p99": _num(pct_map.get("99%") or _pick(metrics, "P99 latency (s)")),
             "latency_max": _num(pct_map.get("max") or _pick(metrics, "Max latency (s)")),
-            "ttft_p50": _num(pct_map.get("TTFT_P50") or pct_map.get("ttft_p50")),
-            "ttft_p99": _num(pct_map.get("TTFT_P99") or pct_map.get("ttft_p99")),
+            "ttft_p50": _num(pct_map.get("TTFT_P50") or pct_map.get("ttft_p50") or pct_map.get("TTFT_50%")),
+            "ttft_p99": _num(pct_map.get("TTFT_P99") or pct_map.get("ttft_p99") or pct_map.get("TTFT_99%")),
             "ttft_max": _num(pct_map.get("TTFT_max") or pct_map.get("ttft_max")),
             "avg_in_tokens": _num(_pick(metrics, "Average input tokens per request",
                                   "Avg Input Tokens", "avg_in_tokens", "input_tokens")),
@@ -566,10 +575,37 @@ def normalize_perf_result(raw: dict) -> dict:
         if row["concurrency"] is not None:
             rows.append(row)
 
+    # 退化检测：success_rate 高但 avg_out_tokens 严重低于预期
+    # 从正常档位推断预期输出长度（取 avg_out_tokens 最大值作为 baseline）
+    expected_tokens = max_tokens
+    if not expected_tokens and rows:
+        expected_tokens = max((r.get("avg_out_tokens") or 0) for r in rows)
+    for r in rows:
+        avg_out = r.get("avg_out_tokens") or 0
+        r["degraded"] = False
+        r["degraded_pct"] = 0.0
+        if expected_tokens and expected_tokens > 0:
+            ratio = avg_out / expected_tokens
+            if ratio < 0.5 and (r.get("success_rate") or 0) > 95:
+                r["degraded"] = True
+                r["degraded_pct"] = round((1 - ratio) * 100, 1)
+                if ratio > 0:
+                    effective = int((r.get("total") or 0) * ratio)
+                    r["effective_requests"] = effective
+                    r["degraded_requests"] = (r.get("total") or 0) - effective
+
     rows.sort(key=lambda r: r["concurrency"] or 0)
     best = max(rows, key=lambda r: r.get("rps") or 0) if rows else None
     lowest_lat = min(rows, key=lambda r: r.get("latency_avg") or 9e9) if rows else None
     rec, warnings = _recommend_perf(rows, best)
+    degraded_levels = [r for r in rows if r.get("degraded")]
+    if degraded_levels:
+        concs = ",".join(str(r["concurrency"]) for r in degraded_levels)
+        warnings.append(
+            f"⚠ 并发 {concs} 档存在静默退化：成功率显示 100% 但平均输出 token "
+            f"远低于预期（{expected_tokens}），大量请求返回空响应。"
+            f"建议以退化前的最高并发档作为有效上限。"
+        )
     return {"sweep": rows, "best": best, "lowest_latency": lowest_lat,
             "recommend": rec, "warnings": warnings,
             "raw": _sanitize_for_json(raw)}
@@ -578,7 +614,11 @@ def normalize_perf_result(raw: dict) -> dict:
 def _norm_percentiles(pct):
     """标准化 percentiles：可能是 dict {P50: x, 90%: y} 或 list [{Percentiles: '50%', ...}]。"""
     if isinstance(pct, dict) and pct:
-        return pct
+        # Handle serialized format: {"rows": [{...}, ...]}
+        if "rows" in pct and isinstance(pct["rows"], list):
+            pct = pct["rows"]
+        else:
+            return pct
     if isinstance(pct, list):
         out = {}
         for item in pct:
@@ -601,7 +641,7 @@ def _norm_percentiles(pct):
                     out[k] = item.get("Latency (s)") or item.get("latency") or item.get(field)
                 # Also add direct metric keys
                 latency = item.get("Latency (s)") or item.get("latency")
-                ttft = item.get("TTFT (ms)") or item.get("TTFT")
+                ttft = item.get("TTFT (ms)") or item.get("TTFT") or item.get("ttft")
                 if latency is not None and k in ("50%", "90%", "99%", "max"):
                     out[k] = latency
                 if ttft is not None and k in ("50%", "90%", "99%", "max"):

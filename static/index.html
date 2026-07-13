@@ -97,6 +97,7 @@
             <select id="apiFormat">
               <option value="openai">OpenAI 兼容</option>
               <option value="vllm">vLLM</option>
+              <option value="anthropic">Anthropic</option>
               <option value="ollama">Ollama 原生</option>
               <option value="raw_completions">Completions</option>
             </select>
@@ -211,15 +212,36 @@
           </label>
         </div>
         <div class="perf-body" id="perfBody">
-          <div class="sweep-hint">并发扫描：对每个并发档位各跑一轮，绘制并发-吞吐-延迟曲线，找出性能拐点与最优并发。</div>
+          <div class="preset-section" style="margin-bottom:12px">
+            <div class="preset-section-label">性能测试预设</div>
+            <div class="preset-cards">
+              <button class="preset-card perf-preset" data-preset="sweep">
+                <div class="pc-title">标准 Sweep</div>
+                <div class="pc-desc">完整并发扫描</div>
+                <div class="pc-params">1~100并发 · 1000请求/档 · 2K入1K出</div>
+              </button>
+              <button class="preset-card perf-preset" data-preset="quick">
+                <div class="pc-title">快速压测</div>
+                <div class="pc-desc">连通性 + 基本性能</div>
+                <div class="pc-params">1~10并发 · 200请求/档 · 短输入</div>
+              </button>
+              <button class="preset-card perf-preset" data-preset="stress">
+                <div class="pc-title">极限压测</div>
+                <div class="pc-desc">高并发压力测试</div>
+                <div class="pc-params">50~200并发 · 1000请求/档 · 短输入</div>
+              </button>
+            </div>
+            <div class="preset-section-label" id="perfPresetHint" style="margin-top:6px;color:var(--data);font-size:10.5px;min-height:18px"></div>
+          </div>
+          <div class="sweep-hint">并发扫描：对每个并发档位各跑一轮。基于 evalscope perf 标准（默认 1000 请求/档，档间 5s 间隔，支持 ratio 预热）。</div>
           <div class="field">
             <label>并发档位 <span class="opt">逗号分隔</span></label>
-            <input id="sweepLevels" type="text" value="1,5,10,15,20">
+            <input id="sweepLevels" type="text" value="1,5,10,50,100">
           </div>
           <div class="field">
             <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
               <label style="margin:0;white-space:nowrap">每档请求数</label>
-              <input id="perfTotal" type="number" value="20" min="1" style="width:80px">
+              <input id="perfTotal" type="number" value="1000" min="1" style="width:80px">
               <label class="switch" style="margin:0" title="启用后，每档请求数 = 并发 × 倍数">
                 <input type="checkbox" id="perfScaleMode">
                 <span class="slider"></span>
@@ -248,8 +270,8 @@
               <input id="perfTimeout" type="number" value="300" min="5">
             </div>
             <div>
-              <label>预热请求 <span class="opt">0=不预热</span></label>
-              <input id="perfWarmup" type="number" value="0" min="0" max="100">
+              <label>预热 <span class="opt">0=不预热，≥1=绝对数，&lt;1=比例(如0.05=5%)</span></label>
+              <input id="perfWarmup" type="number" value="0" min="0" max="100" step="0.01">
             </div>
           </div>
           <div class="field">

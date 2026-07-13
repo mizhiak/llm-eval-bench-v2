@@ -13,15 +13,23 @@ class ModelClient:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key or ""
         self.model = model
-        self.api_format = api_format  # openai | ollama | vllm | raw_completions
+        self.api_format = api_format  # openai | ollama | vllm | raw_completions | anthropic
         self.timeout = timeout
         self.extra_headers = extra_headers or {}
         self.disable_thinking = disable_thinking
 
     def _headers(self) -> dict:
         h = {"Content-Type": "application/json"}
-        if self.api_key:
+        if self.api_format == "anthropic":
+            # Anthropic uses x-api-key header; skip Authorization to avoid confusing the server
+            pass
+        elif self.api_key:
             h["Authorization"] = f"Bearer {self.api_key}"
+        if self.api_key:
+            h["x-api-key"] = self.api_key
+        h["anthropic-version"] = "2023-06-01" if self.api_format == "anthropic" else h.get("anthropic-version", "")
+        if not h.get("anthropic-version"):
+            del h["anthropic-version"]
         h.update(self.extra_headers)
         return h
 
@@ -36,6 +44,10 @@ class ModelClient:
             if "/completions" in self.base_url:
                 return self.base_url
             return f"{self.base_url}/v1/completions"
+        if fmt == "anthropic":
+            if "/messages" in self.base_url:
+                return self.base_url
+            return f"{self.base_url}/v1/messages"
         # openai / vllm 都走 chat/completions
         # 兼容单复数两种拼写：/chat/completion 和 /chat/completions
         if "/chat/completion" in self.base_url:
@@ -89,6 +101,12 @@ class ModelClient:
         if self.disable_thinking:
             # vLLM 部署 Qwen3 的标准关闭思考方式
             payload["chat_template_kwargs"] = {"enable_thinking": False}
+        if fmt == "anthropic":
+            if system:
+                payload["system"] = system  # Anthropic: system is top-level field
+            # Remove max_tokens if it's 0 (Anthropic API requires it, but u-VLLM handles it)
+            if not payload.get("max_tokens"):
+                payload["max_tokens"] = 512
         return payload
 
     def _parse_non_stream(self, data: dict) -> str:
@@ -104,6 +122,17 @@ class ModelClient:
         """
         fmt = self.api_format
         try:
+            if fmt == "anthropic":
+                content_blocks = data.get("content", [])
+                text_parts = []
+                thinking_parts = []
+                for block in content_blocks:
+                    if isinstance(block, dict):
+                        if block.get("type") == "text":
+                            text_parts.append(block.get("text", ""))
+                        elif block.get("type") == "thinking":
+                            thinking_parts.append(block.get("thinking", ""))
+                return ("".join(text_parts), "".join(thinking_parts))
             if fmt == "ollama":
                 msg = data.get("message") or {}
                 return (msg.get("content") or "", msg.get("reasoning_content") or "")
@@ -118,6 +147,7 @@ class ModelClient:
              system: str | None = None) -> dict:
         """非流式调用，返回 {text, latency, prompt_tokens, completion_tokens, ok, error}。"""
         payload = self._build_payload(prompt, max_tokens, temperature, False, system)
+        fmt = self.api_format
         t0 = time.perf_counter()
         result = {"text": "", "reasoning": "", "latency": 0.0, "prompt_tokens": 0,
                   "completion_tokens": 0, "ok": False, "error": None}
@@ -133,9 +163,13 @@ class ModelClient:
             result["reasoning"] = reasoning
             result["has_content"] = bool(content)
             usage = data.get("usage", {}) or {}
-            result["prompt_tokens"] = usage.get("prompt_tokens", 0)
-            result["completion_tokens"] = usage.get("completion_tokens",
-                                                     data.get("eval_count", 0))
+            if fmt == "anthropic":
+                result["prompt_tokens"] = usage.get("input_tokens", 0)
+                result["completion_tokens"] = usage.get("output_tokens", 0)
+            else:
+                result["prompt_tokens"] = usage.get("prompt_tokens", 0)
+                result["completion_tokens"] = usage.get("completion_tokens",
+                                                         data.get("eval_count", 0))
             result["ok"] = True
         except httpx.HTTPStatusError as e:
             result["latency"] = time.perf_counter() - t0
@@ -197,21 +231,39 @@ class ModelClient:
                         except json.JSONDecodeError:
                             continue
                     else:
-                        if line.startswith("data: "):
-                            line = line[6:]
-                        if line.strip() == "[DONE]":
-                            break
-                        try:
-                            obj = json.loads(line)
-                            if fmt == "raw_completions":
-                                chunk = obj["choices"][0].get("text", "")
-                            else:
-                                delta = obj["choices"][0].get("delta", {})
-                                chunk = delta.get("content", "")
-                            if chunk:
-                                yield chunk
-                        except (json.JSONDecodeError, KeyError, IndexError):
-                            continue
+                        if fmt == "anthropic":
+                            # Anthropic SSE: data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"..."}}
+                            if line.startswith("data: "):
+                                line = line[6:]
+                            if not line.strip():
+                                continue
+                            try:
+                                obj = json.loads(line)
+                                if obj.get("type") == "content_block_delta":
+                                    delta = obj.get("delta", {})
+                                    chunk = delta.get("text", "")
+                                    if chunk:
+                                        yield chunk
+                                elif obj.get("type") == "message_stop":
+                                    break
+                            except (json.JSONDecodeError, KeyError, IndexError):
+                                continue
+                        else:
+                            if line.startswith("data: "):
+                                line = line[6:]
+                            if line.strip() == "[DONE]":
+                                break
+                            try:
+                                obj = json.loads(line)
+                                if fmt == "raw_completions":
+                                    chunk = obj["choices"][0].get("text", "")
+                                else:
+                                    delta = obj["choices"][0].get("delta", {})
+                                    chunk = delta.get("content", "")
+                                if chunk:
+                                    yield chunk
+                            except (json.JSONDecodeError, KeyError, IndexError):
+                                continue
 
     def chat_collect(self, prompt: str, max_tokens: int = 512, temperature: float = 0.0,
                      system: str | None = None) -> dict:
@@ -252,32 +304,64 @@ class ModelClient:
                             except json.JSONDecodeError:
                                 continue
                         else:
-                            s = line[6:] if line.startswith("data: ") else line
-                            if s.strip() == "[DONE]":
-                                break
-                            try:
-                                obj = json.loads(s)
-                                ch = obj["choices"][0]
-                                if fmt == "raw_completions":
-                                    if ch.get("text"):
-                                        if ttft is None:
-                                            ttft = time.perf_counter() - t0
-                                        content_parts.append(ch["text"])
-                                else:
-                                    delta = ch.get("delta", {})
-                                    if delta.get("content"):
-                                        if ttft is None:
-                                            ttft = time.perf_counter() - t0
-                                        content_parts.append(delta["content"])
-                                    if delta.get("reasoning_content"):
-                                        if ttft is None:
-                                            ttft = time.perf_counter() - t0
-                                        reasoning_parts.append(delta["reasoning_content"])
-                                if obj.get("usage"):
-                                    result["prompt_tokens"] = obj["usage"].get("prompt_tokens", 0)
-                                    result["completion_tokens"] = obj["usage"].get("completion_tokens", 0)
-                            except (json.JSONDecodeError, KeyError, IndexError):
-                                continue
+                            if fmt == "anthropic":
+                                # Anthropic SSE stream
+                                s = line[6:] if line.startswith("data: ") else line
+                                if not s.strip():
+                                    continue
+                                try:
+                                    obj = json.loads(s)
+                                    evt = obj.get("type", "")
+                                    if evt == "content_block_delta":
+                                        delta = obj.get("delta", {})
+                                        if delta.get("type") == "text_delta":
+                                            txt = delta.get("text", "")
+                                            if txt:
+                                                if ttft is None:
+                                                    ttft = time.perf_counter() - t0
+                                                content_parts.append(txt)
+                                        elif delta.get("type") == "thinking_delta":
+                                            think = delta.get("thinking", "")
+                                            if think:
+                                                if ttft is None:
+                                                    ttft = time.perf_counter() - t0
+                                                reasoning_parts.append(think)
+                                    elif evt == "message_delta":
+                                        usage = obj.get("usage", {})
+                                        if usage:
+                                            result["prompt_tokens"] = usage.get("input_tokens", 0)
+                                            result["completion_tokens"] = usage.get("output_tokens", 0)
+                                    elif evt == "message_stop":
+                                        break
+                                except (json.JSONDecodeError, KeyError, IndexError):
+                                    continue
+                            else:
+                                s = line[6:] if line.startswith("data: ") else line
+                                if s.strip() == "[DONE]":
+                                    break
+                                try:
+                                    obj = json.loads(s)
+                                    ch = obj["choices"][0]
+                                    if fmt == "raw_completions":
+                                        if ch.get("text"):
+                                            if ttft is None:
+                                                ttft = time.perf_counter() - t0
+                                            content_parts.append(ch["text"])
+                                    else:
+                                        delta = ch.get("delta", {})
+                                        if delta.get("content"):
+                                            if ttft is None:
+                                                ttft = time.perf_counter() - t0
+                                            content_parts.append(delta["content"])
+                                        if delta.get("reasoning_content"):
+                                            if ttft is None:
+                                                ttft = time.perf_counter() - t0
+                                            reasoning_parts.append(delta["reasoning_content"])
+                                    if obj.get("usage"):
+                                        result["prompt_tokens"] = obj["usage"].get("prompt_tokens", 0)
+                                        result["completion_tokens"] = obj["usage"].get("completion_tokens", 0)
+                                except (json.JSONDecodeError, KeyError, IndexError):
+                                    continue
             content = "".join(content_parts)
             reasoning = "".join(reasoning_parts)
             result["latency"] = time.perf_counter() - t0

@@ -41,7 +41,7 @@ class PerfConfig(BaseModel):
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
     system: str = ""
     timeout: float = Field(default=300, ge=5, le=7200)
-    warmup_requests: int = Field(default=0, ge=0, le=100)
+    warmup_requests: float = Field(default=0, ge=0, le=100)
     scale_multiplier: int = Field(default=0, ge=0, le=1000)
 
     @model_validator(mode="before")
@@ -110,7 +110,7 @@ class StartConfig(BaseModel):
     @field_validator("api_format")
     @classmethod
     def validate_api_format(cls, v: str):
-        allowed = {"openai", "vllm", "ollama", "raw_completions"}
+        allowed = {"openai", "vllm", "ollama", "raw_completions", "anthropic"}
         if v not in allowed:
             raise ValueError(f"接口格式仅支持：{', '.join(sorted(allowed))}")
         return v
@@ -119,7 +119,7 @@ class StartConfig(BaseModel):
     def validate_test_selection(self):
         if not self.accuracy_datasets and not self.run_performance and not self.context_lengths:
             raise ValueError("请至少选择一项测试")
-        if self.api_format not in {"openai", "vllm"}:
+        if self.api_format not in {"openai", "vllm", "anthropic"}:
             if self.accuracy_datasets or self.run_performance or self.context_lengths:
                 raise ValueError("正式评测/压测仅支持 OpenAI 兼容接口；Ollama 原生和 Completions 仅用于连通性测试")
         return self
@@ -216,7 +216,7 @@ async def preflight(req: Request):
     else:
         add("ok", "接口地址格式", f"Base URL: {base_url}")
 
-    if api_format in {"openai", "vllm"}:
+    if api_format in {"openai", "vllm", "anthropic"}:
         add("ok", "正式评测接口口径", "当前接口格式可进入 evalscope 正式评测。")
     else:
         add("error", "正式评测接口口径", "evalscope 正式评测/压测需要 OpenAI 兼容接口")
