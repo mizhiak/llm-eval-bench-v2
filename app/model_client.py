@@ -409,7 +409,15 @@ class ModelClient:
         return last
 
     def test_connection(self) -> dict:
-        """测试连通性。token 给足以适配思考型模型，并带重试避免起始抖动。"""
-        res = self.chat_with_retry("你好", max_tokens=256, max_retries=2)
+        """测试连通性：max_tokens=1 + 关闭思考，最小化延迟。"""
+        saved_timeout = self.timeout
+        saved_thinking = self.disable_thinking
+        self.timeout = min(self.timeout, 120)
+        self.disable_thinking = True  # 跳过 reasoning，加速首 token
+        try:
+            res = self.chat("hi", max_tokens=1, temperature=0.0)
+        finally:
+            self.timeout = saved_timeout
+            self.disable_thinking = saved_thinking
         return {"ok": res["ok"], "error": res.get("error"),
                 "latency": round(res.get("latency", 0), 3)}

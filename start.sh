@@ -8,8 +8,10 @@ echo "=========================================="
 
 # 离线环境变量：禁止联网下载，强制用本地缓存
 export HF_DATASETS_OFFLINE=1
-export TRANSFORMERS_OFFLINE=1
 export MODELSCOPE_OFFLINE=1
+export HF_ENDPOINT=https://hf-mirror.com
+export TRANSFORMERS_OFFLINE=1
+export EVALSCOPE_DATASET_HUB=modelscope
 export MODELSCOPE_CACHE=${MODELSCOPE_CACHE:-/opt/modelscope_cache}
 export EVALSCOPE_URL=${EVALSCOPE_URL:-http://127.0.0.1:9000}
 

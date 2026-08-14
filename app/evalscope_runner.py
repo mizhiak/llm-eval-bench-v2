@@ -70,6 +70,9 @@ _REALISTIC_PROMPT_SEED = (
 def _build_realistic_prompt(target_tokens):
     if target_tokens <= 0:
         return "请用大约200字介绍一下人工智能的发展历史。"
+    # 防御性上限：与 StartConfig.validate_context_lengths 保持一致，防 OOM
+    if target_tokens > 1_048_576:
+        raise ValueError(f"目标 token 数 {target_tokens} 超过上限 1048576")
     chars_per_token = 1.5
     repeats = max(1, int(target_tokens * chars_per_token / len(_REALISTIC_PROMPT_SEED)) + 1)
     full_text = (_REALISTIC_PROMPT_SEED * repeats)[:int(target_tokens * chars_per_token)]
@@ -78,6 +81,28 @@ def _build_realistic_prompt(target_tokens):
 
 # 映射 app_task_id → evalscope_task_id，用于 stop 级联
 _eval_task_map: dict[str, str] = {}
+_eval_map_lock = threading.Lock()
+
+# 精度评测整体 HTTP 超时（秒）。不能传 None——httpx 的 timeout=None 是禁用超时，
+# evalscope service 挂起时 worker 线程会永久阻塞。
+EVAL_TIMEOUT = int(os.environ.get("EVALSCOPE_EVAL_TIMEOUT", "7200"))
+OUTPUTS_DIR = os.environ.get("OUTPUTS_DIR", "/app/outputs")
+
+
+def register_eval_task(app_task_id: str, es_task_id: str):
+    """登记 app 任务与 evalscope 任务的映射，供 stop 级联取消。"""
+    with _eval_map_lock:
+        _eval_task_map[app_task_id] = es_task_id
+
+
+def get_active_eval_task(app_task_id: str) -> str | None:
+    with _eval_map_lock:
+        return _eval_task_map.get(app_task_id)
+
+
+def clear_eval_task(app_task_id: str):
+    with _eval_map_lock:
+        _eval_task_map.pop(app_task_id, None)
 
 
 def run_accuracy_evalscope(task, cfg: dict, summary: dict):
@@ -129,7 +154,9 @@ def run_accuracy_evalscope(task, cfg: dict, summary: dict):
     for ds in builtin:
         subs = subj_sel.get(ds)
         if subs:
-            dataset_args[ds] = {"subset_list": list(subs)}
+            # setdefault 合并，不能整体赋值——否则会冲掉前面写入的
+            # few_shot_num（数据集默认 shot 数），导致选学科后静默变 0-shot
+            dataset_args.setdefault(ds, {})["subset_list"] = list(subs)
             task.log("info", f"   {ds} 仅评测学科：{', '.join(subs)}")
     if custom:
         from app.custom_dataset import prepare_custom_for_evalscope
@@ -164,7 +191,8 @@ def run_accuracy_evalscope(task, cfg: dict, summary: dict):
 
     # 生成 evalscope task_id，用于 progress/log/stop
     eval_task_id = uuid.uuid4().hex[:12]
-    _eval_task_map[task.id] = eval_task_id
+    register_eval_task(task.id, eval_task_id)
+    task.es_task_id = eval_task_id  # 持久化，供重启后级联取消
 
     holder = {"result": None, "error": None, "done": False}
 
@@ -179,7 +207,7 @@ def run_accuracy_evalscope(task, cfg: dict, summary: dict):
                 stream=acc_stream,
                 disable_thinking=disable_thinking,
                 request_timeout=req_timeout,
-                timeout=None)
+                timeout=EVAL_TIMEOUT)
         except Exception as e:
             holder["error"] = e
         finally:
@@ -244,15 +272,23 @@ def run_accuracy_evalscope(task, cfg: dict, summary: dict):
     th.join(timeout=5)
 
     # 清理映射
-    _eval_task_map.pop(task.id, None)
+    clear_eval_task(task.id)
+    task.es_task_id = None
 
     if holder["error"]:
         task.log("error", f"evalscope 评测失败：{holder['error']}")
         raise holder["error"]
 
     raw = holder["result"] or {}
-    if raw.get("status") and raw.get("status") != "success":
-        task.log("error", f"evalscope 返回非成功状态：{raw.get('message','')}")
+    status = raw.get("status")
+    # evalscope invoke 成功时返回 status='completed'（'success' 仅为兼容）。
+    # HTTP 500 的错误已在 _post 中 raise_for_status 抛 EvalScopeError，不会走到这里；
+    # 这里拦截 HTTP 200 但 status 异常的情况（如 'stopped'/'error'）。
+    if status and status not in ("completed", "success") and not task.stopped():
+        err = (f"evalscope 返回非成功状态：{status}"
+               + (f"：{raw.get('error') or raw.get('message') or ''}" if (raw.get('error') or raw.get('message')) else ""))
+        task.log("error", err)
+        raise es.EvalScopeError(err)
     norm = es.normalize_eval_result(raw)
     for ds_name, d in norm.items():
         d.setdefault("total", limit or None)
@@ -265,7 +301,7 @@ def run_accuracy_evalscope(task, cfg: dict, summary: dict):
             "max_tokens": max_tokens,
             "temperature": temperature,
             "dataset_args": dataset_args.get(ds_name) if isinstance(dataset_args, dict) else None,
-            "output_dir": raw.get("output_dir") or f"/app/outputs/{eval_task_id}",
+            "output_dir": raw.get("output_dir") or os.path.join(OUTPUTS_DIR, eval_task_id),
             "eval_task_id": eval_task_id,
         }
         summary["accuracy"][ds_name] = d
@@ -329,7 +365,8 @@ def run_performance_evalscope(task, cfg: dict, summary: dict):
 
     # 生成 evalscope task_id
     perf_task_id = uuid.uuid4().hex[:12]
-    _eval_task_map[task.id] = perf_task_id
+    register_eval_task(task.id, perf_task_id)
+    task.es_task_id = perf_task_id  # 持久化，供重启后级联取消
 
     holder = {"result": None, "error": None, "done": False}
 
@@ -381,14 +418,18 @@ def run_performance_evalscope(task, cfg: dict, summary: dict):
 
     th.join(timeout=5)
 
-    # 清理临时文件
+    # 清理临时文件（仅当 evalscope 线程已退出，避免删掉仍在读取的文件）
     try:
-        os.unlink(dataset_path)
+        if not th.is_alive():
+            os.unlink(dataset_path)
+        else:
+            task.log("warn", "evalscope 压测尚未完全退出，临时数据集文件延后由系统清理")
     except Exception:
         pass
 
     # 清理映射
-    _eval_task_map.pop(task.id, None)
+    clear_eval_task(task.id)
+    task.es_task_id = None
 
     if holder["error"]:
         task.log("error", f"evalscope 压测失败：{holder['error']}")
@@ -411,7 +452,7 @@ def run_performance_evalscope(task, cfg: dict, summary: dict):
         "url": url,
     }
     result["eval_task_id"] = perf_task_id
-    result["output_dir"] = f"/app/outputs/{perf_task_id}"
+    result["output_dir"] = os.path.join(OUTPUTS_DIR, perf_task_id)
     summary["performance"] = result
     best = result.get("best")
     if best:
@@ -422,7 +463,7 @@ def run_performance_evalscope(task, cfg: dict, summary: dict):
             msg += f" | 稳定推荐并发区间 {rec['min']}~{rec['max']}"
         task.log("success", msg)
         for w in result.get("warnings", [])[:3]:
-            task.log("warn", f"{w.get('title')}：{w.get('message')}")
+            task.log("warn", w if isinstance(w, str) else f"{w.get('title')}：{w.get('message')}")
     else:
         task.log("warn", "压测完成但未解析到指标，请检查 evalscope 返回格式（见原始结果）")
 
@@ -472,7 +513,8 @@ def run_context_scan(task, cfg: dict, summary: dict):
         tmp.close()
 
         perf_task_id = uuid.uuid4().hex[:12]
-        _eval_task_map[task.id] = perf_task_id
+        register_eval_task(task.id, perf_task_id)
+        task.es_task_id = perf_task_id  # 持久化，供重启后级联取消
 
         holder = {"result": None, "error": None, "done": False}
 
@@ -502,10 +544,15 @@ def run_context_scan(task, cfg: dict, summary: dict):
                 break
             time.sleep(5)
         th.join(timeout=5)
-        _eval_task_map.pop(task.id, None)
+        clear_eval_task(task.id)
+        task.es_task_id = None
 
+        # 清理临时文件（仅当 evalscope 线程已退出，避免删掉仍在读取的文件）
         try:
-            os.unlink(tmp.name)
+            if not th.is_alive():
+                os.unlink(tmp.name)
+            else:
+                task.log("warn", "evalscope 压测尚未完全退出，临时数据集文件延后由系统清理")
         except Exception:
             pass
 

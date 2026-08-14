@@ -1,24 +1,110 @@
 """FastAPI 主应用：配置接口、任务启动、SSE 进度流、数据集管理。"""
+import ipaddress
 import os
 import json
 import queue
 import re
 import shutil
+import socket
+import urllib.parse
 from typing import Any
 
-from fastapi import FastAPI, Request, UploadFile, File, HTTPException
+from fastapi import FastAPI, Request, UploadFile, File, HTTPException, Query
 from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator, model_validator
+from starlette.concurrency import run_in_threadpool
 
 from app.model_client import ModelClient
 from app.task_manager import manager, list_datasets, CUSTOM_DIR, DATA_DIR, _load_jsonl
 
 app = FastAPI(title="大模型性能与精度测试工具")
 
+# ===================== 最小鉴权（可选） =====================
+# 设置环境变量 EVALBENCH_AUTH_TOKEN 后，所有 /api 路由要求携带该令牌，
+# 未设置则保持原有匿名访问（内网/已有反代场景）。
+# 令牌支持：Authorization: Bearer <token> / X-Auth-Token 头 / ?token= 查询参数 /
+# evalbench_token Cookie（EventSource 无法自定义头，前端走 ?token= 或 Cookie）。
+AUTH_TOKEN = os.environ.get("EVALBENCH_AUTH_TOKEN", "").strip()
+
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    if AUTH_TOKEN and request.url.path.startswith("/api"):
+        token = (request.headers.get("x-auth-token")
+                 or request.cookies.get("evalbench_token")
+                 or request.query_params.get("token")
+                 or "")
+        auth = request.headers.get("authorization", "")
+        if auth.startswith("Bearer "):
+            token = auth[7:]
+        if token != AUTH_TOKEN:
+            return JSONResponse(
+                {"detail": "未授权：缺少或无效的访问令牌"}, status_code=401)
+    return await call_next(request)
+
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "..", "static")
+OUTPUTS_DIR = os.environ.get("OUTPUTS_DIR", "/app/outputs")
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
 SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+# ===================== SSRF 防护 =====================
+# 代理探测类端点（/api/models、/api/test_connection、/api/preflight）会把用户填的
+# base_url 从服务端发起请求，必须校验目标地址，防止内网探测/元数据访问/密钥外泄。
+# 默认仅拦截链路本地与云元数据地址（正常业务不会命中）；
+# 设置环境变量 BLOCK_PRIVATE_NETWORKS=1 时，额外拦截 RFC1918/回环等私网地址。
+_BLOCK_PRIVATE = os.environ.get("BLOCK_PRIVATE_NETWORKS", "") == "1"
+_PRIVATE_NETS = [ipaddress.ip_network(n) for n in (
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+    "127.0.0.0/8", "::1/128", "fc00::/7", "fe80::/10",
+)]
+_ALWAYS_BLOCKED = [ipaddress.ip_network(n) for n in (
+    "169.254.0.0/16",   # 链路本地（云元数据 169.254.169.254）
+    "0.0.0.0/8",
+    "fd00:ec2::254/128",  # AWS 元数据 IPv6
+)]
+
+
+def validate_target_url(base_url: str) -> str:
+    """校验代理探测目标 URL，防 SSRF。返回规范化后的 base_url（去尾斜杠）。
+
+    非法目标抛 ValueError，由 Pydantic validator / 路由捕获。
+    """
+    base = (base_url or "").strip().rstrip("/")
+    if not base:
+        raise ValueError("缺少 base_url")
+    if not re.match(r"^https?://", base):
+        raise ValueError("base_url 必须以 http:// 或 https:// 开头")
+    try:
+        host = urllib.parse.urlsplit(base).hostname
+    except ValueError:
+        raise ValueError("base_url 无法解析")
+    if not host:
+        raise ValueError("base_url 缺少主机名")
+
+    ips: list = []
+    try:
+        ips.append(ipaddress.ip_address(host))
+    except ValueError:
+        try:
+            infos = socket.getaddrinfo(host, None)
+            ips = [ipaddress.ip_address(info[4][0]) for info in infos]
+        except socket.gaierror:
+            raise ValueError(f"无法解析目标主机名：{host}")
+        if not ips:
+            raise ValueError(f"无法解析目标主机名：{host}")
+
+    for ip in ips:
+        for net in _ALWAYS_BLOCKED:
+            if ip in net:
+                raise ValueError(
+                    f"目标地址 {ip} 位于链路本地/元数据网段，禁止访问")
+        if _BLOCK_PRIVATE:
+            for net in _PRIVATE_NETS:
+                if ip in net:
+                    raise ValueError(
+                        f"目标地址 {ip} 位于私网网段（已启用 BLOCK_PRIVATE_NETWORKS）")
+    return base
 
 
 class ConnTest(BaseModel):
@@ -28,6 +114,11 @@ class ConnTest(BaseModel):
     api_format: str = "openai"
     timeout: float = 30
     disable_thinking: bool = False
+
+    @field_validator("base_url")
+    @classmethod
+    def validate_base_url(cls, v: str):
+        return validate_target_url(v)
 
 
 class PerfConfig(BaseModel):
@@ -77,12 +168,13 @@ class StartConfig(BaseModel):
     timeout: float = Field(default=120, ge=1, le=7200)
     disable_thinking: bool = False
     task_name: str = ""
+    serving_label: str = ""  # 可选：手动填写的被测服务/容器标识，用于溯源展示
     accuracy_datasets: list[str] = Field(default_factory=list)
     dataset_subjects: dict[str, list[str]] = Field(default_factory=dict)
     sample_limit: int = Field(default=0, ge=0)
     few_shot: int = Field(default=0, ge=0, le=50)
     acc_concurrency: int = Field(default=4, ge=1, le=128)
-    acc_max_tokens: int = Field(default=0, ge=0, le=131072)
+    acc_max_tokens: int = Field(default=0, ge=0, le=1048576)
     acc_temperature: float = Field(default=0.0, ge=0.0, le=2.0)
     acc_system: str = ""
     acc_template: str = ""
@@ -123,6 +215,17 @@ class StartConfig(BaseModel):
             if self.accuracy_datasets or self.run_performance or self.context_lengths:
                 raise ValueError("正式评测/压测仅支持 OpenAI 兼容接口；Ollama 原生和 Completions 仅用于连通性测试")
         return self
+
+    @field_validator("context_lengths")
+    @classmethod
+    def validate_context_lengths(cls, v: list[int]):
+        # 防止超长档位在 _build_realistic_prompt 中构造数十 GB 字符串导致 OOM
+        if len(v) > 20:
+            raise ValueError("上下文扫描最多支持 20 个档位")
+        for x in v:
+            if x < 1 or x > 1_048_576:
+                raise ValueError("上下文长度档位必须在 1~1048576 之间")
+        return v
 
 
 # ===================== 路由 =====================
@@ -174,6 +277,106 @@ def queue_status():
     return manager.queue_info()
 
 
+# ============ 模型档案（模型配置持久化，存 /app/data/profiles.json） ============
+PROFILES_PATH = os.path.join(os.path.dirname(DATA_DIR), "profiles.json")
+
+
+def _load_profiles() -> dict:
+    try:
+        with open(PROFILES_PATH, encoding="utf-8") as f:
+            d = json.load(f)
+            return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_profiles(profiles: dict):
+    tmp = PROFILES_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(profiles, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, PROFILES_PATH)
+
+
+class ProfileIn(BaseModel):
+    name: str
+    config: dict
+
+
+@app.get("/api/profiles")
+def list_profiles():
+    return {"profiles": _load_profiles()}
+
+
+@app.post("/api/profiles")
+def save_profile(p: ProfileIn):
+    name = p.name.strip()
+    if not name:
+        raise HTTPException(400, "档案名不能为空")
+    if len(name) > 64:
+        raise HTTPException(400, "档案名过长")
+    profiles = _load_profiles()
+    profiles[name] = p.config
+    _save_profiles(profiles)
+    return {"ok": True, "name": name, "count": len(profiles)}
+
+
+@app.delete("/api/profiles/{name}")
+def delete_profile(name: str):
+    profiles = _load_profiles()
+    existed = name in profiles
+    if existed:
+        del profiles[name]
+        _save_profiles(profiles)
+    return {"ok": True, "existed": existed}
+
+
+# ============ 成绩单（历史任务聚合：模型 × 数据集 分数矩阵） ============
+@app.get("/api/leaderboard")
+def leaderboard():
+    runs = {}   # "model|ds" -> [(finished_at, entry)]
+    models, datasets = set(), set()
+    try:
+        fnames = sorted(os.listdir(DATA_DIR))
+    except Exception:
+        fnames = []
+    for fn in fnames:
+        if not fn.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(DATA_DIR, fn), encoding="utf-8") as f:
+                d = json.load(f)
+        except Exception:
+            continue
+        if d.get("status") != "done":
+            continue
+        model = (d.get("config") or {}).get("model") or "未知模型"
+        acc = (d.get("result") or {}).get("accuracy") or {}
+        fin = d.get("finished_at") or d.get("created") or 0
+        for ds, v in acc.items():
+            if not isinstance(v, dict):
+                v = {"accuracy": v}
+            score = v.get("accuracy")
+            # omni_doc_bench 的 accuracy 是文本编辑距离子指标，综合分取 by_category
+            if ds == "omni_doc_bench":
+                score = ((v.get("by_category") or {}).get("default") or {}).get("score", score)
+            if score is None:
+                continue
+            models.add(model)
+            datasets.add(ds)
+            entry = {"score": round(float(score), 2), "n": v.get("num") or 0,
+                     "task_id": d.get("id"), "task_name": d.get("name") or "",
+                     "finished_at": fin}
+            runs.setdefault(f"{model}|{ds}", []).append((fin, entry))
+    cells = {}
+    for key, lst in runs.items():
+        lst.sort(key=lambda x: x[0], reverse=True)
+        latest = lst[0][1]
+        latest["runs"] = len(lst)
+        latest["prev"] = lst[1][1]["score"] if len(lst) > 1 else None
+        cells[key] = latest
+    return {"models": sorted(models), "datasets": sorted(datasets), "cells": cells}
+
+
 @app.post("/api/test_connection")
 def test_connection(cfg: ConnTest):
     try:
@@ -192,6 +395,36 @@ def test_connection(cfg: ConnTest):
                 "error": f"{type(e).__name__}: {str(e)[:300]}",
                 "trace": traceback.format_exc()[-400:],
                 "latency": 0, "sample": ""}
+
+
+class ModelsQuery(BaseModel):
+    base_url: str
+    api_key: str = ""
+    timeout: float = 15
+
+    @field_validator("base_url")
+    @classmethod
+    def validate_base_url(cls, v: str):
+        return validate_target_url(v)
+
+
+@app.post("/api/models")
+def list_models(q: ModelsQuery):
+    """代理拉取模型列表（/v1/models），避免浏览器跨域。"""
+    import requests as _req
+    base = (q.base_url or "").strip().rstrip("/")
+    if not base:
+        return {"ok": False, "error": "缺少 base_url", "models": []}
+    headers = {"Authorization": f"Bearer {q.api_key}"} if q.api_key else {}
+    try:
+        r = _req.get(f"{base}/models", headers=headers, timeout=q.timeout or 15)
+        if r.status_code != 200:
+            return {"ok": False, "error": f"HTTP {r.status_code}: {r.text[:200]}", "models": []}
+        data = r.json()
+        ids = [m.get("id") for m in data.get("data", []) if m.get("id")]
+        return {"ok": True, "models": ids}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}", "models": []}
 
 
 @app.post("/api/preflight")
@@ -239,7 +472,8 @@ async def preflight(req: Request):
                         body.get("context_max_tokens", 256))
     _check_disk(add)
     _check_dataset_cache(add)
-    _check_model_connection(add, base_url, api_format, body, timeout)
+    # 连通性探测是同步阻塞 HTTP，放到线程池执行，避免卡死事件循环
+    await run_in_threadpool(_check_model_connection, add, base_url, api_format, body, timeout)
 
     errors = sum(1 for x in issues if x["level"] == "error")
     warnings = sum(1 for x in issues if x["level"] == "warn")
@@ -292,9 +526,25 @@ async def start(req: Request):
             "queue_length": qi["queue_length"]}
 
 
+@app.get("/api/serving-info")
+def serving_info(base_url: str = Query("")):
+    """查询被测地址对应的 docker 服务容器（溯源信息）。"""
+    from app import serving
+    info = serving.resolve_serving(base_url)
+    if not info:
+        return {"found": False}
+    return {"found": True, **info}
+
+
 @app.get("/api/tasks")
 def list_tasks():
     return {"tasks": manager.list_tasks()}
+
+
+@app.get("/api/tasks/trash")
+def list_trashed_tasks():
+    """回收站列表（软删除的任务），支持追溯/恢复。注意需注册在 /{task_id} 之前。"""
+    return {"tasks": manager.list_trashed()}
 
 
 @app.get("/api/tasks/{task_id}")
@@ -320,6 +570,22 @@ async def rename_task(task_id: str, req: Request):
 def delete_task(task_id: str):
     manager.delete(task_id)
     return {"ok": True}
+
+
+@app.post("/api/tasks/{task_id}/restore")
+def restore_task(task_id: str):
+    """撤销删除：恢复被软删除的任务。"""
+    if manager.restore(task_id):
+        return {"ok": True}
+    raise HTTPException(404, "任务不存在或已无法恢复")
+
+
+@app.post("/api/tasks/{task_id}/purge")
+def purge_task(task_id: str):
+    """从回收站彻底删除任务（不可恢复）。"""
+    if manager.purge(task_id):
+        return {"ok": True}
+    raise HTTPException(404, "回收站中不存在该任务")
 
 
 @app.get("/api/tasks/{task_id}/export/{fmt}")
@@ -420,16 +686,32 @@ def stream(task_id: str):
     if not task:
         raise HTTPException(404, "任务不存在")
 
+    q = task.subscribe()
+    # 任务已结束时才订阅的客户端：直接补发一个终态事件，避免永远挂 keepalive
+    status = task.status
+    try:
+        if status == "done":
+            q.put_nowait({"type": "done", "result": task.result})
+            q.put_nowait(None)
+        elif status in ("error", "stopped"):
+            q.put_nowait({"type": "done", "result": task.result, "stopped": status == "stopped"})
+            q.put_nowait(None)
+    except queue.Full:
+        pass
+
     def gen():
-        while True:
-            try:
-                event = task.q.get(timeout=30)
-            except queue.Empty:
-                yield ": keepalive\n\n"
-                continue
-            if event is None:
-                break
-            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        try:
+            while True:
+                try:
+                    event = q.get(timeout=30)
+                except queue.Empty:
+                    yield ": keepalive\n\n"
+                    continue
+                if event is None:
+                    break
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        finally:
+            task.unsubscribe(q)
 
     return StreamingResponse(gen(), media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache",
@@ -441,12 +723,16 @@ def stop(task_id: str):
     task = manager.get(task_id)
     if not task:
         raise HTTPException(404, "任务不存在")
+    # 与 /api/tasks/{task_id}/stop 行为一致：排队中的任务也一并移出队列
+    manager.remove_from_queue(task_id)
     task.stop()
     return {"ok": True}
 
 
 @app.get("/api/tasks/{task_id}/samples/{dataset}")
-def task_samples(task_id: str, dataset: str, filter: str = "", page: int = 1, page_size: int = 50):
+def task_samples(task_id: str, dataset: str, filter: str = "",
+                 page: int = Query(1, ge=1),
+                 page_size: int = Query(50, ge=1, le=1000)):
     """返回数据集的逐题答题详情，从 evalscope review 文件中读取。
 
     filter: 空=全部, wrong=仅错题
@@ -505,9 +791,15 @@ def task_perf_requests(task_id: str, eval_task_id: str = "", level: int = 0):
 
     if not eval_task_id:
         raise HTTPException(400, "缺少 eval_task_id")
+    # eval_task_id 是用户可控查询参数：白名单校验 + realpath 防路径穿越
+    if not re.match(r"^[A-Za-z0-9_-]{1,64}$", eval_task_id):
+        raise HTTPException(400, "eval_task_id 格式无效")
 
-    outputs_root = "/app/outputs"
+    outputs_root = OUTPUTS_DIR
+    real_root = os.path.realpath(outputs_root)
     perf_dir = os.path.join(outputs_root, eval_task_id, "perf")
+    if not os.path.realpath(perf_dir).startswith(real_root + os.sep):
+        raise HTTPException(400, "eval_task_id 非法")
     if not os.path.isdir(perf_dir):
         raise HTTPException(404, f"evalscope 输出目录不存在：{perf_dir}")
 
@@ -531,6 +823,7 @@ def task_perf_requests(task_id: str, eval_task_id: str = "", level: int = 0):
 
             level_name = os.path.basename(d)
             records = []
+            itl_all: list[float] = []
             for row in rows:
                 rec = dict(zip(cols, row))
                 # 解析 request JSON 获取 prompt 摘要
@@ -551,6 +844,12 @@ def task_perf_requests(task_id: str, eval_task_id: str = "", level: int = 0):
                     except Exception:
                         itl = []
                 itl_list = itl if isinstance(itl, list) else []
+                # 不回传整条 ITL 列表（数千请求 × 数百 token 会让响应膨胀到数 MB），
+                # 每档只回传聚合统计；明细表仅保留 itl_count
+                try:
+                    itl_all.extend(float(x) for x in itl_list)
+                except (TypeError, ValueError):
+                    pass
                 records.append({
                     "prompt_preview": prompt_text,
                     "prompt_tokens": rec.get("prompt_tokens"),
@@ -558,20 +857,39 @@ def task_perf_requests(task_id: str, eval_task_id: str = "", level: int = 0):
                     "latency": rec.get("latency"),
                     "ttft": rec.get("first_chunk_latency"),
                     "tpot": rec.get("time_per_output_token"),
-                    "inter_token_latencies": itl_list,
                     "itl_count": len(itl_list),
                     "success": bool(rec.get("success")),
                     "start_time": rec.get("start_time"),
                 })
-            all_data[level_name] = records
+            all_data[level_name] = {"records": records, "itl_stats": _itl_stats(itl_all)}
         except Exception as e:
-            all_data[os.path.basename(d)] = [{"error": str(e)}]
+            all_data[os.path.basename(d)] = {"records": [{"error": str(e)}], "itl_stats": None}
 
     return {
         "eval_task_id": eval_task_id,
         "levels": all_data,
         "level_count": len(all_data),
-        "total_requests": sum(len(v) for v in all_data.values()),
+        "total_requests": sum(len(v["records"]) for v in all_data.values()),
+    }
+
+
+def _itl_stats(vals: list[float]) -> dict | None:
+    """对一档的全部 ITL（token 间隔延迟）做聚合统计，替代整表回传。"""
+    if not vals:
+        return None
+    s = sorted(vals)
+    n = len(s)
+
+    def q(p: float) -> float:
+        return s[min(n - 1, int(n * p))]
+
+    return {
+        "count": n,
+        "avg": round(sum(s) / n, 3),
+        "p50": round(q(0.5), 3),
+        "p90": round(q(0.9), 3),
+        "p99": round(q(0.99), 3),
+        "max": round(s[-1], 3),
     }
 
 
@@ -581,8 +899,8 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 # ===================== 辅助函数 =====================
 
 def _find_output_dir(model_name: str) -> str | None:
-    """在 /app/outputs 中搜索包含指定模型 review 文件的输出目录。"""
-    outputs_root = "/app/outputs"
+    """在 OUTPUTS_DIR 中搜索包含指定模型 review 文件的输出目录。"""
+    outputs_root = OUTPUTS_DIR
     if not os.path.isdir(outputs_root):
         return None
     # 优先精确匹配 model_name
@@ -874,6 +1192,11 @@ def _check_dataset_cache(add):
 def _check_model_connection(add, base_url: str, api_format: str, body: dict, timeout):
     if not base_url or not re.match(r"^https?://", base_url):
         add("warn", "模型连通性", "接口地址无效，跳过连通性探测。")
+        return
+    try:
+        base_url = validate_target_url(base_url)
+    except ValueError as e:
+        add("warn", "模型连通性", str(e))
         return
     try:
         client = ModelClient(base_url=base_url, api_key=body.get("api_key", ""),

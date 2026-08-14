@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>大模型测评台 · LLM Eval Bench</title>
-<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/style.css?v=claude1">
 </head>
 <body>
 <div class="app">
@@ -14,7 +14,7 @@
         <svg viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg" aria-label="Eval">
           <rect x="9" y="10" width="3.4" height="20" rx="1.7" fill="#fff"/>
           <rect x="9" y="10" width="22" height="3.4" rx="1.7" fill="#fff"/>
-          <rect x="9" y="18.3" width="14" height="3.4" rx="1.7" fill="#a5f3fc"/>
+          <rect x="9" y="18.3" width="14" height="3.4" rx="1.7" fill="#c7d2fe"/>
           <rect x="9" y="26.6" width="22" height="3.4" rx="1.7" fill="#fff"/>
         </svg>
       </div>
@@ -40,6 +40,7 @@
   <aside class="drawer" id="historyDrawer">
     <div class="drawer-head">
       <span>历史任务</span>
+      <button class="drawer-trash-btn" id="drawerTrashBtn" title="查看已删除的任务（回收站）">🗑 回收站</button>
       <button class="drawer-close" id="drawerClose">✕</button>
     </div>
     <div class="drawer-filters">
@@ -64,37 +65,49 @@
     <aside class="panel config">
       <section class="card">
         <div class="card-head"><span class="idx">01</span>模型接入</div>
-        <div class="preset-section">
-          <div class="preset-section-label">推荐参数预设</div>
-          <div class="preset-cards">
-            <button class="preset-card" id="presetThinking">
-              <div class="pc-title">思考型大模型</div>
-              <div class="pc-desc">235B / QwQ 等强思考</div>
-              <div class="pc-params">超时 600s · 并发 4 · 8192 tok · 流式</div>
-            </button>
-            <button class="preset-card" id="presetInstruct">
-              <div class="pc-title">普通指令模型</div>
-              <div class="pc-desc">7B / 14B 等常规模型</div>
-              <div class="pc-params">超时 120s · 并发 16 · 自动 · 非流式</div>
-            </button>
+        <div class="field">
+          <label>模型档案 <span class="opt">保存/复用模型配置</span></label>
+          <div class="profile-row">
+            <select id="profileSelect"><option value="" selected>不使用档案（手动配置）</option></select>
+            <button type="button" class="btn-mini" id="btnProfileSave" title="把当前表单保存为档案">存</button>
+            <button type="button" class="btn-mini danger" id="btnProfileDel" title="删除选中档案">删</button>
           </div>
         </div>
         <div class="field">
-          <label>接口地址 Base URL</label>
-          <input id="baseUrl" placeholder="http://192.168.1.10:8000/v1">
+          <label>批量评测 <span class="opt">可选 · 勾选多个档案，一键各建任务</span></label>
+          <div class="batch-box">
+            <div class="batch-list" id="batchList"><span class="batch-empty">暂无档案</span></div>
+            <div class="batch-hint" id="batchHint" style="display:none">批量模式已启用：忽略上方连接配置，按勾选的档案分别创建任务（共享下方评测配置）</div>
+          </div>
+        </div>
+        <div class="field">
+          <label>参数预设 <span class="opt">可选 · 一键填充推荐值</span></label>
+          <select id="presetSelect">
+            <option value="" selected>不使用预设（手动配置）</option>
+            <option value="thinking">思考型大模型 · 600s / 并发4 / 8K / 流式（235B/QwQ 等）</option>
+            <option value="instruct">普通指令模型 · 120s / 并发16 / 自动 / 非流式（7B/14B 等）</option>
+          </select>
+          <div class="preset-hint" id="presetHint"></div>
+        </div>
+        <div class="field">
+          <label for="baseUrl">接口地址 Base URL</label> <input id="baseUrl" placeholder="http://192.168.1.10:8000/v1">
         </div>
         <div class="field">
           <label>API Key <span class="opt">（可留空）</span></label>
           <input id="apiKey" type="password" placeholder="sk-...">
         </div>
+        <div class="field">
+          <label>被测服务/容器标识 <span class="opt">可选 · 溯源展示用，留空自动识别容器</span></label>
+          <input id="servingLabel" placeholder="如：model-task-xxx / 生产网关A">
+        </div>
         <div class="field row">
           <div>
-            <label>模型名称</label>
-            <input id="model" placeholder="qwen2.5-7b-instruct">
+            <label>模型名称 <span class="opt">连通测试后自动拉取可选列表</span></label>
+            <input id="model" placeholder="qwen2.5-7b-instruct" list="modelList">
+            <datalist id="modelList"></datalist>
           </div>
           <div>
-            <label>接口格式</label>
-            <select id="apiFormat">
+            <label for="apiFormat">接口格式</label> <select id="apiFormat">
               <option value="openai">OpenAI 兼容</option>
               <option value="vllm">vLLM</option>
               <option value="anthropic">Anthropic</option>
@@ -104,7 +117,7 @@
           </div>
         </div>
         <div class="field">
-          <label>请求超时 timeout <span class="opt">秒</span></label>
+          <label>请求超时 timeout <span class="opt">秒 · 思考型≥600</span></label>
           <input id="timeout" type="number" value="120" min="1">
         </div>
         <div class="field toggle-field">
@@ -128,17 +141,22 @@
         <div class="field" style="margin-bottom:9px">
           <input id="datasetSearch" type="text" placeholder="搜索数据集...">
         </div>
-        <div class="ds-toolbar">
-          <span class="ds-count" id="dsCount">已选 0 个</span>
-          <button class="ds-act" id="dsSelectAll">全选</button>
-          <button class="ds-act" id="dsDeselectAll">取消</button>
-        </div>
-        <div class="dataset-list" id="datasetList">
-          <div class="skeleton skeleton-card"></div>
-          <div class="skeleton skeleton-card"></div>
-          <div class="skeleton skeleton-card"></div>
-          <div class="skeleton skeleton-card"></div>
-        </div>
+        <details class="ds-collect" open>
+          <summary class="ds-collect-head">
+            <span class="ds-count" id="dsCount">已选 0 个</span>
+            <span class="ds-collect-toggle">收起</span>
+          </summary>
+          <div class="ds-toolbar">
+            <button class="ds-act" id="dsSelectAll">全选</button>
+            <button class="ds-act" id="dsDeselectAll">取消</button>
+          </div>
+          <div class="dataset-list" id="datasetList">
+            <div class="skeleton skeleton-card"></div>
+            <div class="skeleton skeleton-card"></div>
+            <div class="skeleton skeleton-card"></div>
+            <div class="skeleton skeleton-card"></div>
+          </div>
+        </details>
         <div class="field upload-row">
           <label class="file-label">
             <svg class="upl-icon" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -165,32 +183,30 @@
           <summary>高级设置</summary>
           <div class="field row">
             <div>
-              <label>批大小 <span class="opt">evalscope eval_batch_size</span></label>
+              <label>批大小 <span class="opt">eval_batch_size · 建议4-20</span></label>
               <input id="accConcurrency" type="number" value="4" min="1" max="64">
             </div>
             <div>
-              <label>max_tokens <span class="opt">留空自动</span></label>
+              <label>max_tokens <span class="opt">留空自动 · 思考型8192-16384</span></label>
               <input id="accMaxTokens" type="number" placeholder="自动" min="1">
             </div>
           </div>
           <div class="field row">
             <div>
-              <label>temperature</label>
-              <input id="accTemperature" type="number" value="0" min="0" max="2" step="0.1">
+              <label for="accTemperature">temperature</label> <input id="accTemperature" type="number" value="0" min="0" max="2" step="0.1">
             </div>
           </div>
           <div class="field">
-            <label>失败重试次数 <span class="opt">网络抖动/空输出时重试</span></label>
+            <label>失败重试次数 <span class="opt">建议2-3次 · 空输出/抖动时重试</span></label>
             <input id="maxRetries" type="number" value="2" min="0" max="5">
           </div>
           <div class="field">
-            <label>测量模式</label>
-            <select id="accStream">
+            <label for="accStream">测量模式</label> <select id="accStream">
               <option value="false">非流式（推荐，精度评测更简单可靠）</option>
               <option value="true">流式（长输出更稳，避免整体超时）</option>
             </select>
           </div>
-          <div class="hint">精度评测建议 temperature=0 以保证结果可复现。思考型模型请把 max_tokens 留空（自动用 256/1024）或调高。</div>
+          <div class="hint">temperature=0 结果可复现；max_tokens 留空 = 自动（选择题 2048 / 数值题 4096），勿超 32768。</div>
           <div class="field">
             <label>System Prompt <span class="opt">可留空</span></label>
             <textarea id="accSystem" rows="2" placeholder="例如：你是一个专业的考试答题助手。"></textarea>
@@ -235,13 +251,12 @@
           </div>
           <div class="sweep-hint">并发扫描：对每个并发档位各跑一轮。基于 evalscope perf 标准（默认 1000 请求/档，档间 5s 间隔，支持 ratio 预热）。</div>
           <div class="field">
-            <label>并发档位 <span class="opt">逗号分隔</span></label>
+            <label>并发档位 <span class="opt">逗号分隔 · 覆盖生产并发0.5-2倍</span></label>
             <input id="sweepLevels" type="text" value="1,5,10,50,100">
           </div>
           <div class="field">
             <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-              <label style="margin:0;white-space:nowrap">每档请求数</label>
-              <input id="perfTotal" type="number" value="1000" min="1" style="width:80px">
+              <label for="perfTotal" style="margin:0;white-space:nowrap">每档请求数</label> <input id="perfTotal" type="number" value="1000" min="1" style="width:80px">
               <label class="switch" style="margin:0" title="启用后，每档请求数 = 并发 × 倍数">
                 <input type="checkbox" id="perfScaleMode">
                 <span class="slider"></span>
@@ -256,8 +271,7 @@
           </div>
           <div class="field row">
             <div>
-              <label>max_tokens</label>
-              <input id="perfMaxTokens" type="number" value="256" min="1">
+              <label for="perfMaxTokens">max_tokens</label> <input id="perfMaxTokens" type="number" value="256" min="1">
             </div>
             <div>
               <label>min_tokens <span class="opt">0=不限</span></label>
@@ -275,8 +289,7 @@
             </div>
           </div>
           <div class="field">
-            <label>测量模式</label>
-            <select id="perfStream">
+            <label for="perfStream">测量模式</label> <select id="perfStream">
               <option value="true">流式（测 TTFT）</option>
               <option value="false">非流式</option>
             </select>
@@ -287,15 +300,13 @@
           </div>
           <div class="perf-ctx-warn" id="perfCtxWarn">⚠ 已启用长上下文填充模式，下方提示词将被替换为重复字符模拟 ~<span id="perfCtxApprox"></span> tokens 输入</div>
           <div class="field" id="perfPromptField">
-            <label>压测提示词</label>
-            <textarea id="perfPrompt" rows="2" placeholder="请用大约200字介绍一下人工智能的发展历史。"></textarea>
+            <label for="perfPrompt">压测提示词</label> <textarea id="perfPrompt" rows="2" placeholder="请用大约200字介绍一下人工智能的发展历史。"></textarea>
           </div>
           <div class="perf-est" id="perfEst"></div>
           <details class="advanced">
             <summary>高级设置</summary>
             <div class="field">
-              <label>temperature</label>
-              <input id="perfTemperature" type="number" value="0" min="0" max="2" step="0.1">
+              <label for="perfTemperature">temperature</label> <input id="perfTemperature" type="number" value="0" min="0" max="2" step="0.1">
             </div>
             <div class="field">
               <label>System Prompt <span class="opt">可留空</span></label>
@@ -322,22 +333,18 @@
           </div>
           <div class="field row">
             <div>
-              <label>固定并发数</label>
-              <input id="ctxConcurrency" type="number" value="8" min="1">
+              <label for="ctxConcurrency">固定并发数</label> <input id="ctxConcurrency" type="number" value="8" min="1">
             </div>
             <div>
-              <label>每档请求数</label>
-              <input id="ctxRequests" type="number" value="20" min="1">
+              <label for="ctxRequests">每档请求数</label> <input id="ctxRequests" type="number" value="20" min="1">
             </div>
           </div>
           <div class="field row">
             <div>
-              <label>max_tokens</label>
-              <input id="ctxMaxTokens" type="number" value="256" min="1">
+              <label for="ctxMaxTokens">max_tokens</label> <input id="ctxMaxTokens" type="number" value="256" min="1">
             </div>
             <div>
-              <label>测量模式</label>
-              <select id="ctxStream">
+              <label for="ctxStream">测量模式</label> <select id="ctxStream">
                 <option value="true">流式（测 TTFT）</option>
                 <option value="false">非流式</option>
               </select>
@@ -362,14 +369,25 @@
     <!-- 右侧结果区 -->
     <main class="panel results">
       <div class="tabs">
-        <button class="tab active" data-tab="live"><span class="tab-dot" id="liveDot"></span>实时进程</button>
+        <button class="tab active" data-tab="board">成绩单</button>
+        <button class="tab" data-tab="live"><span class="tab-dot" id="liveDot"></span>实时进程</button>
         <button class="tab" data-tab="accuracy">精度结果 <span class="tab-badge" id="accBadge"></span></button>
         <button class="tab" data-tab="ctx">上下文扫描 <span class="tab-badge" id="ctxBadge"></span></button>
         <button class="tab" data-tab="perf">性能结果 <span class="tab-badge" id="perfBadge"></span></button>
       </div>
 
+      <!-- 成绩单：模型 × 数据集 分数矩阵 -->
+      <section class="tab-pane active" id="pane-board">
+        <div class="board-head">
+          <div class="board-title">模型成绩单</div>
+          <div class="board-sub">历史已完成评测自动聚合 · 取最新一次分数 · 点击单元格查看任务详情</div>
+          <button type="button" class="btn-mini" id="btnBoardRefresh">刷新</button>
+        </div>
+        <div id="boardBody"><div class="empty-state">加载中…</div></div>
+      </section>
+
       <!-- 实时进程 -->
-      <section class="tab-pane active" id="pane-live">
+      <section class="tab-pane" id="pane-live">
         <div class="task-switcher" id="taskSwitcher" style="display:none"></div>
         <div class="progress-overview" id="progressOverview"></div>
         <div class="console" id="console">
@@ -433,6 +451,6 @@
       </div>
     </div>
   </div>
-<script src="/static/app.js"></script>
+<script src="/static/app.js?v=indigo2"></script>
 </body>
 </html>

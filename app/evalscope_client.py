@@ -23,6 +23,9 @@ class EvalScopeError(Exception):
 
 def _post(path: str, payload: dict, timeout: float = 7200, task_id: str = None) -> dict:
     """调用 evalscope service，长超时（完整评测可能很久）。"""
+    if timeout is None:
+        # httpx 的 timeout=None 是禁用超时；兜底为默认长超时，防止线程永久挂死
+        timeout = 7200
     url = EVALSCOPE_URL.rstrip("/") + path
     headers = {}
     if task_id:
@@ -266,6 +269,10 @@ def run_perf(model: str, url: str, api_key: str, parallel, number,
         payload["prefix_length"] = prefix_length
         payload["min_prompt_length"] = prompt_length
         payload["max_prompt_length"] = prompt_length
+    else:
+        # evalscope 默认 max_prompt_length=131072（字符），超长上下文行会被
+        # 全部过滤导致 "Dataset is empty!"，line_by_line 等场景放开限制
+        payload["max_prompt_length"] = 100_000_000
     if tokenizer_path:
         payload["tokenizer_path"] = tokenizer_path
     if dataset_path:
@@ -363,8 +370,12 @@ def normalize_eval_result(raw: dict) -> dict:
     for ds_name, ds_data in report.items():
         if not isinstance(ds_data, dict):
             continue
-        score = (ds_data.get("score") or ds_data.get("accuracy")
-                 or ds_data.get("AverageAccuracy"))
+        # 注意不能用 or 链：score=0.0 是合法分数，会被 or 吞成 None 显示"见详情"
+        score = ds_data.get("score")
+        if score is None:
+            score = ds_data.get("accuracy")
+        if score is None:
+            score = ds_data.get("AverageAccuracy")
 
         # 从 metrics[].categories[].subsets[] 提取学科/类别分数
         by_subject = {}
@@ -447,6 +458,15 @@ def renormalize_stored_result(result: dict) -> dict:
         raw = ds_data.get("raw")
         if not isinstance(raw, dict):
             continue
+        # 顶层 accuracy 被旧版 or 链吞成 None 的修复（0.0 是合法分数，应从 raw 重提）
+        if ds_data.get("accuracy") is None:
+            rs = raw.get("score")
+            if rs is None:
+                rs = raw.get("accuracy")
+            if rs is None:
+                rs = raw.get("AverageAccuracy")
+            if rs is not None:
+                ds_data["accuracy"] = _pct(rs)
         # 只在旧数据缺失时才从 raw 重提
         need_fix = not ds_data.get("by_subject") and not ds_data.get("by_category")
         if not need_fix:

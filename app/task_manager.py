@@ -4,10 +4,13 @@ import time
 import uuid
 import json
 import queue
+import logging
 import threading
 import collections
 
 from app.model_client import ModelClient
+
+logger = logging.getLogger("task_manager")
 
 
 CUSTOM_DIR = os.path.join(os.path.dirname(__file__), "..", "custom_datasets")
@@ -70,13 +73,19 @@ def _detect_type(items: list[dict]) -> str:
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "tasks")
 os.makedirs(DATA_DIR, exist_ok=True)
 
+# 回收站保留策略：默认 0 = 永久保留（评测历史可长期追溯）；
+# 设置为正数 N 时，启动阶段自动清除删除超过 N 天的回收站文件。
+TRASH_RETENTION_DAYS = int(os.environ.get("TRASH_RETENTION_DAYS", "0"))
+
 
 class Task:
+    # 每个 SSE 客户端独立订阅队列的最大容量（慢客户端丢最旧事件，不阻塞评测线程）
+    SUBSCRIBER_MAXSIZE = 2000
+
     def __init__(self, task_id: str, config: dict, name: str = ""):
         self.id = task_id
         self.config = config
         self.name = name or self._default_name(config)
-        self.q: queue.Queue = queue.Queue()
         self.status = "pending"  # pending|queued|running|stopping|done|error|stopped
         self.result = {}
         self._stop = False
@@ -85,6 +94,42 @@ class Task:
         self.logs: list[dict] = []
         self.sweep_levels: list[dict] = []
         self.last_progress: dict = {}
+        self.deleted = False  # 运行中被删除：停止持久化，防止任务“复活”
+        # 当前阶段活动的 evalscope task_id：持久化供重启后级联取消孤儿任务
+        self.es_task_id: str | None = None
+        # SSE 广播：多个标签页同时观看同一任务时，事件广播到每个订阅者
+        # （旧实现是单队列，事件被多客户端瓜分，日志会串页）
+        self._subs: list[queue.Queue] = []
+        self._subs_lock = threading.Lock()
+
+    def subscribe(self) -> queue.Queue:
+        """为新的 SSE 连接创建独立订阅队列。"""
+        q = queue.Queue(maxsize=self.SUBSCRIBER_MAXSIZE)
+        with self._subs_lock:
+            self._subs.append(q)
+        return q
+
+    def unsubscribe(self, q: queue.Queue):
+        with self._subs_lock:
+            try:
+                self._subs.remove(q)
+            except ValueError:
+                pass
+
+    def _publish(self, event):
+        """把事件广播给所有订阅者；None 哨兵表示流结束，也必须送达。"""
+        with self._subs_lock:
+            subs = list(self._subs)
+        for q in subs:
+            try:
+                q.put_nowait(event)
+            except queue.Full:
+                # 慢客户端：丢掉最旧事件再塞入，避免阻塞评测线程
+                try:
+                    q.get_nowait()
+                    q.put_nowait(event)
+                except queue.Empty:
+                    pass
 
     @staticmethod
     def _default_name(config: dict) -> str:
@@ -93,51 +138,57 @@ class Task:
         return f"{model} · {ts}"
 
     def _persist(self):
+        if self.deleted:
+            return  # 运行中被删除的任务不再落盘
         try:
             path = os.path.join(DATA_DIR, f"{self.id}.json")
             data = {
                 "id": self.id, "name": self.name, "status": self.status,
+                # api_key 脱敏后再落盘，避免明文密钥留在磁盘（rerun 会重新要求输入）
                 "config": _safe_config(self.config), "result": _sanitize_json(self.result),
                 "created": self.created, "finished_at": self.finished_at,
                 "logs": self.logs[-500:], "sweep_levels": self.sweep_levels,
+                "es_task_id": self.es_task_id,
             }
             tmp = path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False)
             os.replace(tmp, path)
         except Exception:
-            pass
+            logger.exception("任务 %s 持久化失败", self.id)
 
     def log(self, level: str, msg: str, **extra):
         event = {"type": "log", "level": level, "msg": msg, "ts": time.time()}
         event.update(extra)
         self.logs.append(event)
-        self.q.put(event)
+        if len(self.logs) > 2000:  # 内存日志设上限，长任务不无限增长
+            self.logs = self.logs[-1500:]
+        self._publish(event)
 
     def progress(self, **kw):
         self.last_progress = kw
-        self.q.put({"type": "progress", **kw})
+        self._publish({"type": "progress", **kw})
 
     def emit(self, event: dict):
         if event.get("type") == "sweep_level":
             self.sweep_levels.append(event)
-        self.q.put(event)
+        self._publish(event)
 
     def finish(self, result: dict):
         self.status = "done"
         self.result = result
         self.finished_at = time.time()
         self._persist()
-        self.q.put({"type": "done", "result": result})
-        self.q.put(None)
+        self._publish({"type": "done", "result": result})
+        self._publish(None)
 
     def fail(self, err: str):
         self.status = "error"
         self.finished_at = time.time()
         self.logs.append({"type": "log", "level": "error", "msg": err, "ts": time.time()})
         self._persist()
-        self.q.put({"type": "error", "msg": err})
-        self.q.put(None)
+        self._publish({"type": "error", "msg": err})
+        self._publish(None)
 
     def mark_running(self):
         self.status = "running"
@@ -145,21 +196,30 @@ class Task:
 
     def stop(self):
         self._stop = True
-        if self.status in ("pending", "queued", "running"):
+        # 排队中（尚未启动）的任务直接落 stopped：
+        # 旧逻辑统一置 stopping，但 queued 任务永远等不到 evalscope 收尾，会永远卡"停止中"
+        if self.status in ("pending", "queued"):
+            self.status = "stopped"
+            self.finished_at = time.time()
+            self.log("warn", "任务在排队中被停止，未实际执行评测。")
+            self._persist()
+            self._publish({"type": "done", "result": self.result, "stopped": True})
+            self._publish(None)
+            return
+        if self.status == "running":
             self.status = "stopping"
-            # 如果还在排队（还没执行），标记为已停止并从队列移除
             # 队列移除由 TaskManager.delete/stop 处理
             self.log("warn", "已收到停止请求。正在请求 evalscope 取消任务...")
             self._persist()
             # 级联停止 evalscope 任务
             try:
-                from app.evalscope_runner import _eval_task_map
-                eval_id = _eval_task_map.get(self.id)
+                from app.evalscope_runner import get_active_eval_task, clear_eval_task
+                eval_id = get_active_eval_task(self.id)
                 if eval_id:
                     from app import evalscope_client as es
                     es.stop_eval(eval_id)
                     es.stop_perf(eval_id)
-                    _eval_task_map.pop(self.id, None)
+                    clear_eval_task(self.id)
             except Exception:
                 pass
 
@@ -213,6 +273,14 @@ def _result_summary(result: dict, config: dict = None) -> dict:
         if pc:
             out["perf_levels"] = pc.get("levels", [])
             out["context_length"] = pc.get("context_length", 0) or None
+        sv = config.get("serving")
+        if sv:
+            out["serving"] = {
+                "container": sv.get("container"),
+                "image": sv.get("image"),
+                "label": sv.get("label"),
+                "models": sv.get("models", []),
+            }
     return out
 
 
@@ -228,18 +296,28 @@ class TaskManager:
         self._reap_zombies()
 
     def _reap_zombies(self):
-        """启动时扫描磁盘：把 status=running 但进程已不在内存的任务标记为 stopped。"""
+        """启动时扫描磁盘：把 status=running/stopping 但进程已不在内存的任务标记为
+        stopped，并尽力向 evalscope service 级联取消遗留任务；同时清理过期回收站文件。"""
         if not os.path.isdir(DATA_DIR):
             return
         now = time.time()
         for fn in os.listdir(DATA_DIR):
+            path = os.path.join(DATA_DIR, fn)
+            # 回收站文件：仅在显式设置保留天数时自动清理（默认永久保留，保证可追溯）
+            if fn.endswith(".json.trash"):
+                try:
+                    if TRASH_RETENTION_DAYS > 0 and \
+                            time.time() - os.path.getmtime(path) > TRASH_RETENTION_DAYS * 86400:
+                        os.remove(path)
+                except Exception:
+                    pass
+                continue
             if not fn.endswith(".json"):
                 continue
-            path = os.path.join(DATA_DIR, fn)
             try:
                 with open(path, encoding="utf-8") as f:
                     d = json.load(f)
-                if d.get("status") != "running":
+                if d.get("status") not in ("running", "stopping"):
                     continue
                 d["status"] = "stopped"
                 d["finished_at"] = d.get("finished_at") or now
@@ -252,6 +330,16 @@ class TaskManager:
                 with open(tmp, "w", encoding="utf-8") as f:
                     json.dump(d, f, ensure_ascii=False)
                 os.replace(tmp, path)
+                # 级联取消 evalscope 侧遗留任务（若 service 仍存活）
+                es_id = d.get("es_task_id")
+                if es_id:
+                    try:
+                        from app import evalscope_client as es
+                        es.stop_eval(es_id)
+                        es.stop_perf(es_id)
+                        logger.warning("重启清理：已尝试取消遗留 evalscope 任务 %s", es_id)
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
@@ -308,14 +396,16 @@ class TaskManager:
 
     def queue_info(self) -> dict:
         """返回当前队列状态。"""
+        # _running_task_ids 统一由 _queue_lock 保护，先取快照再遍历，避免迭代中变更
+        with self._queue_lock:
+            running_ids = list(self._running_task_ids)
+            queue_list = [{"id": t.id, "name": t.name} for t in self._queue]
         running = []
         with self._lock:
-            for tid in self._running_task_ids:
+            for tid in running_ids:
                 t = self.tasks.get(tid)
                 if t:
                     running.append({"id": t.id, "name": t.name, "status": t.status})
-        with self._queue_lock:
-            queue_list = [{"id": t.id, "name": t.name} for t in self._queue]
         return {
             "running": running,
             "queue": queue_list,
@@ -367,9 +457,13 @@ class TaskManager:
                     created = d.get("created")
                     finished = d.get("finished_at")
                     dur = round(finished - created, 1) if (finished and created) else None
+                    status = d.get("status")
+                    # 容器重启后，遗留的 running 任务实际已停止
+                    if status == "running":
+                        status = "stopped"
                     seen[tid] = {
                         "id": d["id"], "name": d.get("name", tid),
-                        "status": d.get("status"), "created": created,
+                        "status": status, "created": created,
                         "finished_at": finished,
                         "model": d.get("config", {}).get("model", ""),
                         "base_url": (d.get("config", {}).get("base_url") or "")[:50],
@@ -424,6 +518,11 @@ class TaskManager:
                 finished = d.get("finished_at")
                 dur = round(finished - created, 1) if (finished and created) else None
                 d["duration"] = dur
+                # 容器重启后，遗留的 running 任务实际已停止
+                if d.get("status") == "running":
+                    d["status"] = "stopped"
+                # 脱敏 api_key
+                d["config"] = _safe_config(d.get("config", {}))
                 # 从 raw 字段重提 by_subject/by_category（修复旧版数据）
                 from app.evalscope_client import renormalize_stored_result
                 renormalize_stored_result(d.get("result"))
@@ -445,8 +544,10 @@ class TaskManager:
                 with open(path, encoding="utf-8") as f:
                     d = json.load(f)
                 d["name"] = name
-                with open(path, "w", encoding="utf-8") as f:
+                tmp = path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
                     json.dump(d, f, ensure_ascii=False)
+                os.replace(tmp, path)  # 原子替换，避免中途崩溃损坏任务文件
                 return True
             except Exception:
                 return False
@@ -458,14 +559,74 @@ class TaskManager:
             self._queue = collections.deque(
                 t for t in self._queue if t.id != tid
             )
-        self.tasks.pop(tid, None)
+        t = self.tasks.pop(tid, None)
+        if t is not None:
+            # 运行中的任务：标记 deleted 阻止后续持久化（防“复活”），并级联停止
+            t.deleted = True
+            try:
+                t.stop()
+            except Exception:
+                logger.exception("停止任务 %s 时出错", tid)
         path = os.path.join(DATA_DIR, f"{tid}.json")
         if os.path.exists(path):
             try:
-                os.remove(path)
+                # 软删除：改名进回收站而非直接删除，支持 restore 撤销
+                os.replace(path, path + ".trash")
             except Exception:
                 return False
         return True
+
+    def restore(self, tid: str) -> bool:
+        """把软删除的任务恢复回任务列表。"""
+        path = os.path.join(DATA_DIR, f"{tid}.json")
+        trash = path + ".trash"
+        if not os.path.exists(trash):
+            return False
+        if os.path.exists(path):
+            return False  # 同名任务已存在（如已重新创建）
+        try:
+            os.replace(trash, path)
+            return True
+        except Exception:
+            logger.exception("恢复任务 %s 失败", tid)
+            return False
+
+    def list_trashed(self) -> list[dict]:
+        """列出回收站中的任务（软删除但未彻底删除），支持追溯与恢复。"""
+        out = []
+        if not os.path.isdir(DATA_DIR):
+            return out
+        for fn in sorted(os.listdir(DATA_DIR), reverse=True):
+            if not fn.endswith(".json.trash"):
+                continue
+            path = os.path.join(DATA_DIR, fn)
+            try:
+                with open(path, encoding="utf-8") as f:
+                    d = json.load(f)
+                out.append({
+                    "id": d.get("id", fn[:-11]),
+                    "name": d.get("name", d.get("id", fn[:-11])),
+                    "status": d.get("status", "unknown"),
+                    "model": (d.get("config") or {}).get("model", ""),
+                    "created": d.get("created"),
+                    "finished_at": d.get("finished_at"),
+                    "deleted_at": os.path.getmtime(path),
+                })
+            except Exception:
+                logger.exception("读取回收站文件 %s 失败", fn)
+        return out
+
+    def purge(self, tid: str) -> bool:
+        """彻底删除回收站中的任务（不可恢复）。"""
+        trash = os.path.join(DATA_DIR, f"{tid}.json.trash")
+        if not os.path.exists(trash):
+            return False
+        try:
+            os.remove(trash)
+            return True
+        except Exception:
+            logger.exception("彻底删除任务 %s 失败", tid)
+            return False
 
     def _make_client(self, cfg: dict) -> ModelClient:
         return ModelClient(
@@ -477,6 +638,9 @@ class TaskManager:
 
     def _run(self, task: Task):
         cfg = task.config
+        # 出队后、启动前被停止的任务直接退出，避免被 mark_running 复活
+        if task.stopped():
+            return
         task.mark_running()
         try:
             task.log("info", f"开始评测，模型：{cfg.get('model','(未指定)')}，"
@@ -491,6 +655,30 @@ class TaskManager:
                 task.fail(f"连通性测试失败：{conn['error']}")
                 return
             task.log("success", f"连通性正常（延迟 {conn['latency']}s）")
+
+            # 溯源：关联被测服务容器名/镜像 + 抓取目标服务模型列表（best-effort）
+            try:
+                from app import serving
+                sv: dict = {}
+                info = serving.resolve_serving(cfg.get("base_url", ""))
+                if info:
+                    sv.update(info)
+                models = serving.probe_models(cfg.get("base_url", ""), cfg.get("api_key", ""))
+                if models:
+                    sv["models"] = models
+                label = (cfg.get("serving_label") or "").strip()
+                if label:
+                    sv["label"] = label
+                if sv:
+                    task.config["serving"] = sv
+                    task._persist()
+                    if info:
+                        task.log("info", f"被测服务容器：{info['container']}（{info['image']}）")
+                    if models:
+                        task.log("info", f"目标服务模型列表：{', '.join(models[:5])}"
+                                          f"{'…' if len(models) > 5 else ''}")
+            except Exception:
+                pass
 
             from app import evalscope_client as es
             if not es.health():
@@ -520,7 +708,7 @@ class TaskManager:
                 task.result = summary
                 task._persist()
                 task.emit({"type": "done", "result": summary, "stopped": True})
-                task.q.put(None)
+                task._publish(None)
             else:
                 task.finish(summary)
         except Exception as e:

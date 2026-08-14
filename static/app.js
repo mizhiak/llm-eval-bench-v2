@@ -1,6 +1,29 @@
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => document.querySelectorAll(s);
 
+// ---- 可选鉴权支持 ----
+// 后端设置 EVALBENCH_AUTH_TOKEN 后，前端通过 ?token= 传递令牌。
+// 首次可访问 http://host/?token=xxx 把令牌存入 localStorage，随后自动带上。
+(function initAuth() {
+  const params = new URLSearchParams(location.search);
+  const t = params.get("token");
+  if (t) {
+    try { localStorage.setItem("evalbench_token", t); } catch (e) {}
+    params.delete("token");
+    const qs = params.toString();
+    history.replaceState(null, "", location.pathname + (qs ? "?" + qs : ""));
+  }
+  const _fetch = window.fetch;
+  window.fetch = function (url, opts) {
+    let tk = null;
+    try { tk = localStorage.getItem("evalbench_token"); } catch (e) {}
+    if (tk && typeof url === "string") {
+      url = url + (url.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(tk);
+    }
+    return _fetch.call(this, url, opts);
+  };
+})();
+
 let selectedDatasets = new Set();
 let selectedSubjects = new Map();  // dsName -> Set(subjects)
 let currentTaskId = null;
@@ -85,15 +108,17 @@ $("#ctxBody").classList.add("disabled");
   $("#ctxConcurrency").addEventListener(evt, updateCtxEstimate);
   $("#ctxRequests").addEventListener(evt, updateCtxEstimate);
   $("#ctxMaxTokens").addEventListener(evt, updateCtxEstimate);
-  // Dataset selection changes
-  document.addEventListener("click", e => {
-    if (e.target.closest(".ds-item") || e.target.closest(".subj-chip") || e.target.closest(".subj-clear")) {
-      setTimeout(updateConfigSummaries, 100);
-    }
-    if (e.target.closest("#btnLoadPerfReq")) {
-      loadPerfRequests();
-    }
-  });
+});
+
+// 委托式 click 监听：数据集选择 / 逐请求明细按钮。
+// 注意：必须放在上面的 forEach 之外，否则会被重复注册（点击触发两次请求）。
+document.addEventListener("click", e => {
+  if (e.target.closest(".ds-item") || e.target.closest(".subj-chip") || e.target.closest(".subj-clear")) {
+    setTimeout(updateConfigSummaries, 100);
+  }
+  if (e.target.closest("#btnLoadPerfReq")) {
+    loadPerfRequests();
+  }
 });
 
 function updatePerfEstimate() {
@@ -175,6 +200,20 @@ async function loadDatasets() {
     $("#datasetList").innerHTML = '<div class="loading-sm">加载失败，请刷新</div>';
   }
 }
+
+// Dataset categories
+const DS_CATEGORIES = {
+  "中文评测": ["ceval", "chinese_simpleqa", "cmmlu", "cmmmu"],
+  "数学推理": ["aime25", "aime26", "gsm8k", "math_500", "math_vision", "math_vista", "mgsm", "minerva_math", "competition_math", "olympiad_bench"],
+  "代码生成": ["humaneval", "humaneval_plus", "live_code_bench", "mbpp", "mbpp_plus", "multiple_humaneval"],
+  "多模态": ["ai2d", "chartqa", "mm_bench", "mmmu", "mmmu_pro", "real_world_qa", "seed_bench_2_plus"],
+  "常识推理": ["arc", "commonsense_qa", "hellaswag", "piqa", "qasc", "sciq", "siqa", "winogrande", "race"],
+  "知识问答": ["bbh", "drop", "mmlu", "mmlu_pro", "mmlu_redux", "pubmedqa", "simple_qa", "trivia_qa", "truthful_qa", "super_gpqa"],
+  "指令遵循": ["ifbench", "ifeval", "multi_if"],
+  "逻辑推理": ["logi_qa"],
+  "长文本": ["longbench_v2", "needle_haystack"],
+};
+
 let _allDatasets = [];
 function renderDatasets(list, filter = "") {
   _allDatasets = list;
@@ -193,68 +232,140 @@ function renderDatasets(list, filter = "") {
       : '<div class="skeleton skeleton-card"></div><div class="skeleton skeleton-card"></div><div class="skeleton skeleton-card"></div><div class="skeleton skeleton-card"></div>';
     return;
   }
+
+  // Group datasets by category
+  const grouped = {};
+  const uncategorized = [];
+  
   filtered.forEach(ds => {
-    const wrap = document.createElement("div");
-    wrap.className = "ds-wrap";
-    const item = document.createElement("div");
-    item.className = "ds-item" + (selectedDatasets.has(ds.name) ? " checked" : "");
-    const typeTag = ds.type === "numeric" ? "数值" : "选择";
-    const hasSubjects = ds.subjects && ds.subjects.length > 1;
-    item.innerHTML = `
-      <input type="checkbox" ${selectedDatasets.has(ds.name) ? "checked" : ""}>
-      <span class="ds-name">${ds.display}</span>
-      <span class="ds-type">${typeTag}</span>
-      <span class="ds-meta">${ds.count} 题</span>
-      ${hasSubjects ? `<button class="ds-subj-btn" title="选择学科子集">学科</button>` : ""}`;
-    item.addEventListener("click", (e) => {
-      if (e.target.classList.contains("ds-subj-btn")) return;
-      if (selectedDatasets.has(ds.name)) selectedDatasets.delete(ds.name);
-      else selectedDatasets.add(ds.name);
-      item.classList.toggle("checked");
-      item.querySelector("input").checked = selectedDatasets.has(ds.name);
-    });
-    wrap.appendChild(item);
-    // 学科子集面板
-    if (hasSubjects) {
-      const panel = document.createElement("div");
-      panel.className = "ds-subjects";
-      panel.style.display = "none";
-      panel.innerHTML = `<div class="subj-head">
-        <span>选择学科（不选=全部 ${ds.subjects.length} 个）</span>
-        <button class="subj-clear">清空</button></div>
-        <div class="subj-chips"></div>`;
-      const chips = panel.querySelector(".subj-chips");
-      ds.subjects.forEach(s => {
-        const chip = document.createElement("button");
-        chip.className = "subj-chip"; chip.textContent = s;
-        chip.addEventListener("click", () => {
-          const set = selectedSubjects.get(ds.name) || new Set();
-          if (set.has(s)) set.delete(s); else set.add(s);
-          selectedSubjects.set(ds.name, set);
-          chip.classList.toggle("on", set.has(s));
-          // 选了学科自动勾选该数据集
-          if (set.size && !selectedDatasets.has(ds.name)) {
-            selectedDatasets.add(ds.name);
-            item.classList.add("checked");
-            item.querySelector("input").checked = true;
-          }
-          updateSubjBtnLabel(item, ds.name);
-        });
-        chips.appendChild(chip);
-      });
-      panel.querySelector(".subj-clear").addEventListener("click", () => {
-        selectedSubjects.delete(ds.name);
-        panel.querySelectorAll(".subj-chip").forEach(c => c.classList.remove("on"));
-        updateSubjBtnLabel(item, ds.name);
-      });
-      wrap.appendChild(panel);
-      item.querySelector(".ds-subj-btn").addEventListener("click", (e) => {
-        e.stopPropagation();
-        panel.style.display = panel.style.display === "none" ? "block" : "none";
-      });
+    let found = false;
+    for (const [cat, names] of Object.entries(DS_CATEGORIES)) {
+      if (names.includes(ds.name)) {
+        if (!grouped[cat]) grouped[cat] = [];
+        grouped[cat].push(ds);
+        found = true;
+        break;
+      }
     }
-    el.appendChild(wrap);
+    if (!found) uncategorized.push(ds);
   });
+
+  // Render categorized groups
+  for (const [cat, datasets] of Object.entries(grouped)) {
+    if (!datasets.length) continue;
+    const groupEl = document.createElement("details");
+    groupEl.className = "ds-group";
+    groupEl.open = false; // Collapsed by default
+    
+    const selectedInGroup = datasets.filter(ds => selectedDatasets.has(ds.name)).length;
+    const totalCount = datasets.reduce((sum, ds) => sum + (ds.count || 0), 0);
+    
+    groupEl.innerHTML = `
+      <summary class="ds-group-head">
+        <span class="ds-group-name">${cat}</span>
+        <span class="ds-group-meta">${datasets.length} 个数据集 · ${totalCount} 题${selectedInGroup ? ` · 已选 ${selectedInGroup}` : ''}</span>
+      </summary>
+      <div class="ds-group-body"></div>
+    `;
+    
+    const body = groupEl.querySelector(".ds-group-body");
+    datasets.forEach(ds => body.appendChild(createDatasetItem(ds)));
+    el.appendChild(groupEl);
+  }
+
+  // Render uncategorized
+  if (uncategorized.length) {
+    const groupEl = document.createElement("details");
+    groupEl.className = "ds-group";
+    groupEl.open = true; // Expanded by default
+    
+    const selectedInGroup = uncategorized.filter(ds => selectedDatasets.has(ds.name)).length;
+    const totalCount = uncategorized.reduce((sum, ds) => sum + (ds.count || 0), 0);
+    
+    groupEl.innerHTML = `
+      <summary class="ds-group-head">
+        <span class="ds-group-name">其他</span>
+        <span class="ds-group-meta">${uncategorized.length} 个数据集 · ${totalCount} 题${selectedInGroup ? ` · 已选 ${selectedInGroup}` : ''}</span>
+      </summary>
+      <div class="ds-group-body"></div>
+    `;
+    
+    const body = groupEl.querySelector(".ds-group-body");
+    uncategorized.forEach(ds => body.appendChild(createDatasetItem(ds)));
+    el.appendChild(groupEl);
+  }
+}
+
+function createDatasetItem(ds) {
+  const wrap = document.createElement("div");
+  wrap.className = "ds-wrap";
+  const item = document.createElement("div");
+  item.className = "ds-item" + (selectedDatasets.has(ds.name) ? " checked" : "");
+  const typeTag = ds.type === "numeric" ? "数值" : "选择";
+  const hasSubjects = ds.subjects && ds.subjects.length > 1;
+  // Special handling for dynamic datasets
+  const isDynamic = ds.name === 'longbench_v2' || ds.name === 'needle_haystack';
+  const countDisplay = isDynamic ? '动态' : `${ds.count} 题`;
+  const isLongText = ds.name === 'longbench_v2' || ds.name === 'needle_haystack';
+  const warnIcon = isLongText ? '<span class="ds-warn" title="长文本测试需要模型支持较长上下文（建议≥32K），否则可能崩溃或结果不准确">⚠</span>' : '';
+  item.innerHTML = `
+    <input type="checkbox" ${selectedDatasets.has(ds.name) ? "checked" : ""}>
+    <span class="ds-name">${esc(ds.display)}</span>
+    ${warnIcon}
+    <span class="ds-type">${typeTag}</span>
+    <span class="ds-meta">${countDisplay}</span>
+    ${hasSubjects ? `<button class="ds-subj-btn" title="选择学科子集">学科</button>` : ""}`;
+  item.addEventListener("click", (e) => {
+    if (e.target.classList.contains("ds-subj-btn")) return;
+    if (selectedDatasets.has(ds.name)) selectedDatasets.delete(ds.name);
+    else selectedDatasets.add(ds.name);
+    item.classList.toggle("checked");
+    item.querySelector("input").checked = selectedDatasets.has(ds.name);
+    updateDsCount();
+  });
+  wrap.appendChild(item);
+  // 学科子集面板
+  if (hasSubjects) {
+    const panel = document.createElement("div");
+    panel.className = "ds-subjects";
+    panel.style.display = "none";
+    panel.innerHTML = `<div class="subj-head">
+      <span>选择学科（不选=全部 ${ds.subjects.length} 个）</span>
+      <button class="subj-clear">清空</button></div>
+      <div class="subj-chips"></div>`;
+    const chips = panel.querySelector(".subj-chips");
+    ds.subjects.forEach(s => {
+      const chip = document.createElement("button");
+      chip.className = "subj-chip"; chip.textContent = s;
+      chip.addEventListener("click", () => {
+        const set = selectedSubjects.get(ds.name) || new Set();
+        if (set.has(s)) set.delete(s); else set.add(s);
+        selectedSubjects.set(ds.name, set);
+        chip.classList.toggle("on", set.has(s));
+        // 选了学科自动勾选该数据集
+        if (set.size && !selectedDatasets.has(ds.name)) {
+          selectedDatasets.add(ds.name);
+          item.classList.add("checked");
+          item.querySelector("input").checked = true;
+        }
+        updateSubjBtnLabel(item, ds.name);
+        updateDsCount();
+      });
+      chips.appendChild(chip);
+    });
+    panel.querySelector(".subj-clear").addEventListener("click", () => {
+      selectedSubjects.delete(ds.name);
+      panel.querySelectorAll(".subj-chip").forEach(c => c.classList.remove("on"));
+      updateSubjBtnLabel(item, ds.name);
+      updateDsCount();
+    });
+    wrap.appendChild(panel);
+    item.querySelector(".ds-subj-btn").addEventListener("click", (e) => {
+      e.stopPropagation();
+      panel.style.display = panel.style.display === "none" ? "block" : "none";
+    });
+  }
+  return wrap;
 }
 
 function updateSubjBtnLabel(item, dsName) {
@@ -292,11 +403,13 @@ renderDatasets = function(list, filter) {
   updateDsCount();
 };
 
-// Dataset search filter
+// Dataset search filter（200ms 防抖，避免每敲一个字全量重建列表）
 const dsSearch = document.getElementById("datasetSearch");
 if (dsSearch) {
+  let _dsTimer = null;
   dsSearch.addEventListener("input", () => {
-    renderDatasets(_allDatasets, dsSearch.value);
+    clearTimeout(_dsTimer);
+    _dsTimer = setTimeout(() => renderDatasets(_allDatasets, dsSearch.value), 200);
   });
 }
 
@@ -313,10 +426,10 @@ $("#fileInput").addEventListener("change", async e => {
       selectedDatasets.add(data.name);
       await loadDatasets();
     } else {
-      alert("上传失败：" + (data.detail || "未知错误"));
+      toast("上传失败：" + (data.detail || "未知错误"), "error");
     }
   } catch (err) {
-    alert("上传失败：" + err.message);
+    toast("上传失败：" + err.message, "error");
   }
   e.target.value = "";
 });
@@ -332,6 +445,7 @@ function buildConfig() {
     timeout: parseFloat($("#timeout").value) || 120,
     disable_thinking: $("#disableThinking").checked,
     task_name: $("#taskName").value.trim(),
+    serving_label: ($("#servingLabel")?.value || "").trim(),
     accuracy_datasets: [...selectedDatasets],
     dataset_subjects: Object.fromEntries(
       [...selectedSubjects.entries()]
@@ -406,6 +520,8 @@ $("#btnTest").addEventListener("click", async () => {
     if (data.ok) {
       out.className = "conn-result ok";
       out.textContent = `✓ 连通正常 · 延迟 ${data.latency}s · 返回: ${data.sample || "(空)"}`;
+      fetchModels();
+      fetchServingInfo(cfg.base_url);  // 溯源：关联被测服务容器
     } else {
       out.className = "conn-result err";
       const ep = data.endpoint ? ` [请求地址: ${data.endpoint}]` : "";
@@ -416,6 +532,44 @@ $("#btnTest").addEventListener("click", async () => {
   }
   $("#btnTest").disabled = false;
 });
+
+// ---- 拉取模型列表（经后端代理，避免跨域）----
+// ---- 溯源：查询被测地址对应的服务容器 ----
+async function fetchServingInfo(baseUrl) {
+  const out = $("#connResult");
+  if (!out) return;
+  try {
+    const r = await fetch("/api/serving-info?base_url=" + encodeURIComponent(baseUrl));
+    const d = await r.json();
+    if (d.found && d.container) {
+      const extra = document.createElement("div");
+      extra.className = "conn-serving";
+      extra.innerHTML = `🐳 被测服务容器：<b>${esc(d.container)}</b>${d.image ? ` <span class="mono-dim">(${esc(d.image)})</span>` : ""}${d.status ? ` · ${esc(d.status)}` : ""}${d.ambiguous ? " · ⚠ 同端口多容器" : ""}`;
+      out.appendChild(extra);
+    }
+  } catch (e) { /* 溯源失败不影响主流程 */ }
+}
+
+async function fetchModels() {
+  const baseUrl = $("#baseUrl").value.trim();
+  if (!baseUrl) return;
+  try {
+    const r = await fetch("/api/models", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ base_url: baseUrl, api_key: $("#apiKey").value.trim() }),
+    });
+    const d = await r.json();
+    if (d.ok && d.models && d.models.length) {
+      $("#modelList").innerHTML = d.models.map(m => `<option value="${esc(m)}">`).join("");
+      // 模型名为空且只有一个模型时自动填上
+      if (!$("#model").value.trim() && d.models.length === 1) {
+        $("#model").value = d.models[0];
+        saveForm();
+      }
+    }
+  } catch (e) { /* 拉取失败静默，手填即可 */ }
+}
+$("#baseUrl").addEventListener("blur", fetchModels);
 
 // ---- Preflight ----
 $("#btnPreflight").addEventListener("click", async () => {
@@ -465,6 +619,11 @@ function renderPreflight(data) {
 }
 
 // ---- Console logging ----
+let consoleStick = true;  // 用户上翻时暂停自动滚底，回到底部恢复
+$("#console").addEventListener("scroll", () => {
+  const c = $("#console");
+  consoleStick = (c.scrollHeight - c.scrollTop - c.clientHeight) < 40;
+});
 function addLog(level, msg, ts) {
   const c = $("#console");
   const empty = c.querySelector(".console-empty");
@@ -477,7 +636,9 @@ function addLog(level, msg, ts) {
   line.innerHTML = `<span class="ts">${time}</span><span class="tag">[${tags[level] || "INFO"}]</span><span class="msg"></span>`;
   line.querySelector(".msg").textContent = msg;
   c.appendChild(line);
-  c.scrollTop = c.scrollHeight;
+  // DOM 行数上限：长任务日志不无限增长，超限移除最早的行
+  while (c.children.length > 2500 && c.firstChild) c.removeChild(c.firstChild);
+  if (consoleStick) c.scrollTop = c.scrollHeight;
 }
 
 function setStatus(text, cls) {
@@ -548,7 +709,7 @@ function updateProgressOverview(ev) {
   el.innerHTML = `<div class="po-track">
     <div class="po-head">
       <span class="po-icon">${icon}</span>
-      <span class="po-title">${title}</span>
+      <span class="po-title">${esc(title)}</span>
     </div>
     <div class="po-bar-wrap">
       <div class="po-bar"><div class="po-bar-fill" style="width:${Math.round(pct)}%"></div></div>
@@ -558,8 +719,8 @@ function updateProgressOverview(ev) {
       <span>${completed}/${total}</span>
       <span>\u23f1 \u5df2\u8fd0\u884c ${fmtDur(elapsed)}</span>
       ${eta != null ? `<span>\u9884\u8ba1\u5269\u4f59 \u2248${fmtDur(eta)}</span>` : ""}
-      ${next ? `<span class="po-next">\u2192 ${next}</span>` : ""}
-      ${detail ? `<span class="po-detail">${detail}</span>` : ""}
+      ${next ? `<span class="po-next">\u2192 ${esc(next)}</span>` : ""}
+      ${detail ? `<span class="po-detail">${esc(detail)}</span>` : ""}
     </div>
   </div>`;
 }
@@ -567,12 +728,13 @@ function updateProgressOverview(ev) {
 // ---- Start ----
 $("#btnStart").addEventListener("click", async () => {
   const cfg = buildConfig();
-  if (!cfg.base_url) { alert("请填写接口地址 Base URL"); return; }
-  if (cfg.accuracy_datasets.length === 0 && !cfg.run_performance) {
-    alert("请至少选择一个精度数据集，或开启性能压测"); return;
+  if (window._batchModels && window._batchModels.size > 0) { batchStart(cfg); return; }
+  if (!cfg.base_url) { toast("请填写接口地址 Base URL", "warn");return; }
+  if (cfg.accuracy_datasets.length === 0 && !cfg.run_performance && cfg.context_lengths.length === 0) {
+    toast("请至少选择一个精度数据集、性能压测或上下文扫描", "warn");return;
   }
   if (!["openai", "vllm", "anthropic"].includes(cfg.api_format)) {
-    alert("正式评测/压测仅支持 OpenAI 兼容 / Anthropic 接口。Ollama 原生和 Completions 可用于连通性测试，但不能直接进入 evalscope。");
+    toast("正式评测/压测仅支持 OpenAI 兼容 / Anthropic 接口。Ollama 原生和 Completions 可用于连通性测试，但不能直接进入 evalscope。", "info");
     return;
   }
   // reset
@@ -596,7 +758,8 @@ $("#btnStart").addEventListener("click", async () => {
   $("#btnStop").style.display = "block";
   setStatus("运行中", "running");
   // switch to live tab
-  $$(".tab")[0].click();
+  const _lt = document.querySelector('[data-tab="live"]');
+  if (_lt) _lt.click();
 
   try {
     const r = await fetch("/api/start", {
@@ -623,10 +786,10 @@ $("#btnStart").addEventListener("click", async () => {
 });
 
 $("#btnStop").addEventListener("click", async () => {
-  if (currentTaskId) {
-    await fetch("/api/stop/" + currentTaskId, { method: "POST" });
-    addLog("warn", "已发送停止信号，等待当前任务结束…");
-  }
+  if (!currentTaskId) return;
+  if (!confirm("确定停止当前测评？已完成的进度会保存，之后可续跑。")) return;
+  await fetch("/api/stop/" + currentTaskId, { method: "POST" });
+  addLog("warn", "已发送停止信号，等待当前任务结束…");
 });
 
 function resetButtons() {
@@ -644,12 +807,32 @@ function connectStream(taskId) {
 function _ensureStream(taskId) {
   if (_taskStreams[taskId]) return _taskStreams[taskId];
   const st = { es: null, logs: [], progress: null, sweepRows: [], result: null, done: false, mode: "" };
-  st.es = new EventSource("/api/stream/" + taskId);
-  st.es.onmessage = (e) => {
-    const ev = JSON.parse(e.data);
-    _handleStreamEvent(taskId, ev);
+  let streamUrl = "/api/stream/" + taskId;
+  try {
+    const tk = localStorage.getItem("evalbench_token");
+    if (tk) streamUrl += "?token=" + encodeURIComponent(tk);
+  } catch (e) {}
+  st.es = new EventSource(streamUrl);
+  st.es.onopen = () => {
+    st._connWarned = false;  // 重连成功后复位告警标记
+    if (taskId === currentTaskId && !st.done) setStatus("运行中", "running");
   };
-  st.es.onerror = () => { st.es.close(); };
+  st.es.onmessage = (e) => {
+    try {
+      _handleStreamEvent(taskId, JSON.parse(e.data));
+    } catch (err) { /* 单条事件损坏不影响后续事件 */ }
+  };
+  st.es.onerror = () => {
+    if (st.done) { st.es.close(); return; }  // 任务已结束：服务端关流属正常
+    // 运行中连接中断：保留 EventSource 原生自动重连，仅提示一次
+    if (!st._connWarned) {
+      st._connWarned = true;
+      if (taskId === currentTaskId) {
+        addLog("warn", "实时连接中断，正在自动重连…");
+        setStatus("重连中…", "running");
+      }
+    }
+  };
   _taskStreams[taskId] = st;
   return st;
 }
@@ -698,6 +881,7 @@ function _handleStreamEvent(taskId, ev) {
 
   if (ev.type === "log") {
     st.logs.push({ level: ev.level, msg: ev.msg, ts: ev.ts });
+    if (st.logs.length > 2500) st.logs.splice(0, st.logs.length - 2000);  // 内存日志设上限
     if (isActive) addLog(ev.level, ev.msg, ev.ts);
   } else if (ev.type === "progress") {
     st.progress = ev;
@@ -718,18 +902,32 @@ function _handleStreamEvent(taskId, ev) {
     if (isActive) renderPerf({ sweep: st.sweepRows });
   } else if (ev.type === "done") {
     st.done = true;
+    st.es.close();  // 任务结束，关闭连接避免累积长连接
     st.result = ev.result;
+    if (ev.stopped) flashTitle("⏹ 任务已停止 · LLM Eval Bench");
+    else { flashTitle("✅ 评测完成 · LLM Eval Bench"); toast("评测完成，结果已更新", "success"); }
+    loadBoard();
     if (isActive) {
       if (ev.stopped) { setStatus("已停止", "error"); addLog("warn", "测评已停止"); }
       else { setStatus("完成", "done"); addLog("success", "全部测评完成 ✓"); }
       _reviewTaskId = taskId;
       renderResults(ev.result);
       resetButtons();
+      // 完成后自动跳到有结果的页签（board/live/accuracy/ctx/perf）
+      const _res = ev.result || {};
+      const _hasAcc = _res.accuracy && Object.keys(_res.accuracy).length;
+      const _hasPerf = _res.performance && Object.keys(_res.performance).length;
+      const _hasCtx = _res.context_scan && (_res.context_scan.sweep || []).length;
+      const tabs = $$(".tab");
+      if (_hasAcc && tabs[2]) tabs[2].click();
+      else if (_hasPerf && tabs[4]) tabs[4].click();
+      else if (_hasCtx && tabs[3]) tabs[3].click();
     }
-    if (drawer.classList.contains("open")) loadTaskList();
+    if (drawer.classList.contains("open")) refreshDrawerList();
     _renderTaskSwitcher();
   } else if (ev.type === "error") {
     st.done = true;
+    st.es.close();  // 任务结束，关闭连接避免累积长连接
     if (isActive) { addLog("error", ev.msg); setStatus("错误", "error"); resetButtons(); }
     _renderTaskSwitcher();
   }
@@ -839,8 +1037,8 @@ function ctxSweepChart(rows) {
   const line = (pts, color, w) =>
     `<polyline points="${pts.map(p => p.join(",")).join(" ")}" fill="none"
       stroke="${color}" stroke-width="${w}" stroke-linecap="round" stroke-linejoin="round"/>`;
-  const dots = (pts, color) => pts.map(p =>
-    `<circle cx="${p[0]}" cy="${p[1]}" r="3.5" fill="${color}" stroke="#0d1220" stroke-width="1.5"/>`).join("");
+  const dots = (pts, color, titleFn) => pts.map((p, i) =>
+    `<circle cx="${p[0]}" cy="${p[1]}" r="3.5" fill="${color}" stroke="#ffffff" stroke-width="1.5">${titleFn ? `<title>${esc(titleFn(i))}</title>` : ""}</circle>`).join("");
 
   const rpsPts = valid.map(r => [xPos(r.context_length), yRps(r.rps || 0)]);
   const p99Pts = valid.map(r => [xPos(r.context_length), yLat(r.latency_p99 || r.latency_avg)]);
@@ -849,28 +1047,28 @@ function ctxSweepChart(rows) {
   let grid = "";
   for (let i = 0; i <= 4; i++) {
     const y = padT + (plotH / 4) * i;
-    grid += `<line x1="${padL}" y1="${y}" x2="${W - padR}" y2="${y}" stroke="#222c44" stroke-width="1"/>`;
-    grid += `<text x="${padL - 8}" y="${y + 4}" text-anchor="end" fill="#22d3ee" font-size="9" font-family="monospace">${(maxRps * (1 - i / 4)).toFixed(1)}</text>`;
+    grid += `<line x1="${padL}" y1="${y}" x2="${W - padR}" y2="${y}" stroke="#e4e4e7" stroke-width="1"/>`;
+    grid += `<text x="${padL - 8}" y="${y + 4}" text-anchor="end" fill="#4f46e5" font-size="9" font-family="monospace">${(maxRps * (1 - i / 4)).toFixed(1)}</text>`;
   }
   const xlabels = valid.map(r =>
-    `<text x="${xPos(r.context_length)}" y="${H - padB + 18}" text-anchor="middle" fill="#8b96b0" font-size="10" font-family="monospace">${fmtSize(r.context_length)}</text>`).join("");
+    `<text x="${xPos(r.context_length)}" y="${H - padB + 18}" text-anchor="middle" fill="#71717a" font-size="10" font-family="monospace">${fmtSize(r.context_length)}</text>`).join("");
 
   return `<div class="chart-legend">
-    <span class="lg"><i style="background:#22d3ee"></i>RPS</span>
-    <span class="lg"><i style="background:#fb7185"></i>P99</span>
-    <span class="lg"><i style="background:#f59e0b"></i>TTFT</span>
+    <span class="lg"><i style="background:#4f46e5"></i>RPS</span>
+    <span class="lg"><i style="background:#18181b"></i>P99</span>
+    <span class="lg"><i style="background:#d97706"></i>TTFT</span>
     <span class="lg-axis">左轴 RPS · 右轴 延迟(s)</span>
   </div>
   <svg viewBox="0 0 ${W} ${H}" class="sweep-svg" xmlns="http://www.w3.org/2000/svg">
     ${grid}
-    ${line(p99Pts, "#fb7185", 1.8)}
-    ${line(ttftPts, "#f59e0b", 1.8)}
-    ${line(rpsPts, "#22d3ee", 2.4)}
-    ${dots(p99Pts, "#fb7185")}
-    ${dots(ttftPts, "#f59e0b")}
-    ${dots(rpsPts, "#22d3ee")}
+    ${line(p99Pts, "#18181b", 1.8)}
+    ${line(ttftPts, "#d97706", 1.8)}
+    ${line(rpsPts, "#4f46e5", 2.4)}
+    ${dots(p99Pts, "#18181b", i => `上下文 ${fmtSize(valid[i].context_length)} · P99 ${fmtMetric(valid[i].latency_p99 ?? valid[i].latency_avg)}s`)}
+    ${dots(ttftPts, "#d97706", i => `上下文 ${fmtSize(valid[i].context_length)} · TTFT ${fmtMetric(valid[i].ttft_avg)}s`)}
+    ${dots(rpsPts, "#4f46e5", i => `上下文 ${fmtSize(valid[i].context_length)} · RPS ${fmtMetric(valid[i].rps)}`)}
     ${xlabels}
-    <text x="${W / 2}" y="${H - 6}" text-anchor="middle" fill="#5a6685" font-size="11" font-family="monospace">上下文长度 (tokens)</text>
+    <text x="${W / 2}" y="${H - 6}" text-anchor="middle" fill="#71717a" font-size="11" font-family="monospace">上下文长度 (tokens)</text>
   </svg>`;
 }
 
@@ -980,7 +1178,7 @@ function renderAccuracy(acc) {
           <div class="bar-track"><div class="bar-val" style="width:${Math.min(v,100)}%;background:${sc}"></div></div></div>
           </td></tr>`;
       }
-      subjTable = `<details class="result-mini" open>
+      subjTable = `<details class="result-mini">
         <summary>学科 / 子集得分 (${subjs.length})</summary>
         <div class="table-scroll"><table><thead><tr><th>学科</th><th>题目</th><th>准确率</th></tr></thead><tbody>${rows}</tbody></table></div>
       </details>`;
@@ -1060,7 +1258,7 @@ function renderAccuracy(acc) {
         tokSection += `</details>`;
       }
 
-      perfHtml = `<details class="result-mini" open>
+      perfHtml = `<details class="result-mini">
         <summary>推理性能统计</summary>
         ${overview}
         ${latSection}
@@ -1097,7 +1295,7 @@ function renderAccuracy(acc) {
       wrong = `<details class="wrong-samples"><summary>错题样本 (${r.wrong_samples.length})</summary>` +
         r.wrong_samples.map(w => `<div class="ws-item">
           <div class="q">Q: ${esc(w.question)}</div>
-          <div>正确: <span class="exp">${w.expected}</span> · 模型: <span class="got">${esc(w.got)}</span></div>
+          <div>正确: <span class="exp">${esc(w.expected)}</span> · 模型: <span class="got">${esc(w.got)}</span></div>
           ${w.raw ? `<div class="ws-raw">原始输出: ${esc(w.raw)}</div>` : ""}
         </div>`).join("") + `</details>`;
     }
@@ -1321,7 +1519,7 @@ async function loadPerfRequests() {
   if (!block) return;
   const evalTaskId = block.dataset.evalTaskId;
   const level = parseInt(document.getElementById("perfReqLevel")?.value) || 0;
-  if (!evalTaskId) { alert("缺少 eval_task_id"); return; }
+  if (!evalTaskId) { toast("缺少 eval_task_id", "warn");return; }
 
   const stats = document.getElementById("perfReqStats");
   const table = document.getElementById("perfReqTable");
@@ -1335,16 +1533,20 @@ async function loadPerfRequests() {
 
   try {
     const resp = await fetch(`/api/tasks/_/perf-requests?eval_task_id=${encodeURIComponent(evalTaskId)}&level=${level}`);
-    if (!resp.ok) { const t = await resp.text(); alert("加载失败：" + t); return; }
+    if (!resp.ok) { const t = await resp.text(); toast("加载失败：" + t, "error");return; }
     const data = await resp.json();
 
     let allRecords = [];
-    for (const [levelName, records] of Object.entries(data.levels || {})) {
+    const itlLevels = [];
+    for (const [levelName, lv] of Object.entries(data.levels || {})) {
+      // 新版响应：{records, itl_stats}；兼容旧版纯数组
+      const records = Array.isArray(lv) ? lv : (lv.records || []);
       if (records.length && records[0].error) continue;
       for (const r of records) {
         r._level = levelName;
         allRecords.push(r);
       }
+      if (lv && lv.itl_stats && lv.itl_stats.count) itlLevels.push({ level: levelName, ...lv.itl_stats });
     }
 
     if (!allRecords.length) {
@@ -1371,26 +1573,25 @@ async function loadPerfRequests() {
 
     table.style.display = "block";
 
-    // ITL distribution summary
-    const itlVals = [];
-    for (const r of allRecords) {
-      if (r.inter_token_latencies && r.inter_token_latencies.length) {
-        for (const v of r.inter_token_latencies) itlVals.push(v);
-      }
-    }
-    if (itlVals.length) {
-      itlVals.sort((a,b) => a - b);
-      const avg = itlVals.reduce((s,v) => s + v, 0) / itlVals.length;
-      const p50 = itlVals[Math.floor(itlVals.length * 0.5)];
-      const p99 = itlVals[Math.floor(itlVals.length * 0.99)];
-      const mx = itlVals[itlVals.length - 1];
+    // ITL 分布：后端已按档聚合（avg/P50/P90/P99/max），前端只做加权合并展示
+    if (itlLevels.length) {
+      const totalCount = itlLevels.reduce((s, x) => s + x.count, 0);
+      const wAvg = itlLevels.reduce((s, x) => s + x.avg * x.count, 0) / totalCount;
+      const p99Max = Math.max(...itlLevels.map(x => x.p99 ?? 0));
+      const mx = Math.max(...itlLevels.map(x => x.max ?? 0));
+      const p50Max = Math.max(...itlLevels.map(x => x.p50 ?? 0));
+      const levelLines = itlLevels.map(s => {
+        const conc = (s.level.match(/^parallel_(\d+)_/) || [])[1] || s.level;
+        return `<span>并发 ${esc(conc)}：${s.count} 间隔 · avg ${s.avg}ms · P50 ${s.p50}ms · P99 ${s.p99}ms · max ${s.max}ms</span>`;
+      }).join("");
       dist.innerHTML = `<div class="perf-req-summary">
-        <span><b>ITL 分布</b>（${itlVals.length} 个 token 间隔）</span>
-        <span>avg ${avg.toFixed(1)}ms</span>
-        <span>P50 ${p50.toFixed(1)}ms</span>
-        <span>P99 ${p99.toFixed(1)}ms</span>
+        <span><b>ITL 分布</b>（${totalCount} 个 token 间隔 · 各档聚合）</span>
+        <span>加权avg ${wAvg.toFixed(1)}ms</span>
+        <span>P50(最高档) ${p50Max.toFixed(1)}ms</span>
+        <span>P99(最高档) ${p99Max.toFixed(1)}ms</span>
         <span>max ${mx.toFixed(1)}ms</span>
-      </div>`;
+      </div>
+      <div class="perf-req-summary sub">${levelLines}</div>`;
     }
   } catch (e) {
     stats.textContent = "加载出错：" + e.message;
@@ -1415,8 +1616,8 @@ function sweepChart(rows) {
   const line = (pts, color, w = 2) =>
     `<polyline points="${pts.map(p => p.join(",")).join(" ")}" fill="none"
       stroke="${color}" stroke-width="${w}" stroke-linecap="round" stroke-linejoin="round"/>`;
-  const dots = (pts, color) => pts.map(p =>
-    `<circle cx="${p[0]}" cy="${p[1]}" r="3.5" fill="${color}" stroke="#0d1220" stroke-width="1.5"/>`).join("");
+  const dots = (pts, color, titleFn) => pts.map((p, i) =>
+    `<circle cx="${p[0]}" cy="${p[1]}" r="3.5" fill="${color}" stroke="#ffffff" stroke-width="1.5">${titleFn ? `<title>${esc(titleFn(i))}</title>` : ""}</circle>`).join("");
 
   const rpsPts = rows.map(r => [xPos(r.concurrency), yRps(r.rps || 0)]);
   const latPts = rows.map(r => [xPos(r.concurrency), yLat(r.latency_avg || 0)]);
@@ -1427,34 +1628,34 @@ function sweepChart(rows) {
   for (let i = 0; i <= 4; i++) {
     const y = padT + (plotH / 4) * i;
     grid += `<line x1="${padL}" y1="${y}" x2="${W - padR}" y2="${y}"
-      stroke="#222c44" stroke-width="1"/>`;
-    grid += `<text x="${padL - 8}" y="${y + 4}" text-anchor="end" fill="#22d3ee"
+      stroke="#e4e4e7" stroke-width="1"/>`;
+    grid += `<text x="${padL - 8}" y="${y + 4}" text-anchor="end" fill="#4f46e5"
       font-size="10" font-family="monospace">${(maxRps * (1 - i / 4)).toFixed(1)}</text>`;
-    grid += `<text x="${W - padR + 8}" y="${y + 4}" text-anchor="start" fill="#fb7185"
+    grid += `<text x="${W - padR + 8}" y="${y + 4}" text-anchor="start" fill="#18181b"
       font-size="10" font-family="monospace">${(maxLat * (1 - i / 4)).toFixed(2)}</text>`;
   }
   // x 轴档位标签
   let xlabels = rows.map(r =>
     `<text x="${xPos(r.concurrency)}" y="${H - padB + 18}" text-anchor="middle"
-      fill="#8b96b0" font-size="10" font-family="monospace">${r.concurrency}</text>`).join("");
+      fill="#71717a" font-size="10" font-family="monospace">${r.concurrency}</text>`).join("");
 
   return `
     <div class="chart-legend">
-      <span class="lg"><i style="background:#22d3ee"></i>RPS 吞吐</span>
-      <span class="lg"><i style="background:#6366f1"></i>平均延迟</span>
-      <span class="lg"><i style="background:#fb7185"></i>P90 延迟</span>
+      <span class="lg"><i style="background:#4f46e5"></i>RPS 吞吐</span>
+      <span class="lg"><i style="background:#0d9488"></i>平均延迟</span>
+      <span class="lg"><i style="background:#18181b"></i>P90 延迟</span>
       <span class="lg-axis">左轴 RPS · 右轴 延迟(s)</span>
     </div>
     <svg viewBox="0 0 ${W} ${H}" class="sweep-svg" xmlns="http://www.w3.org/2000/svg">
       ${grid}
-      ${line(latPts, "#6366f1", 1.8)}
-      ${line(p90Pts, "#fb7185", 1.8)}
-      ${line(rpsPts, "#22d3ee", 2.4)}
-      ${dots(latPts, "#6366f1")}
-      ${dots(p90Pts, "#fb7185")}
-      ${dots(rpsPts, "#22d3ee")}
+      ${line(latPts, "#0d9488", 1.8)}
+      ${line(p90Pts, "#18181b", 1.8)}
+      ${line(rpsPts, "#4f46e5", 2.4)}
+      ${dots(latPts, "#0d9488", i => `并发 ${rows[i].concurrency} · 平均延迟 ${fmtMetric(rows[i].latency_avg)}s`)}
+      ${dots(p90Pts, "#18181b", i => `并发 ${rows[i].concurrency} · P90 延迟 ${fmtMetric(rows[i].latency_p90)}s`)}
+      ${dots(rpsPts, "#4f46e5", i => `并发 ${rows[i].concurrency} · RPS ${fmtMetric(rows[i].rps)} · 成功率 ${rows[i].success_rate ?? "-"}%`)}
       ${xlabels}
-      <text x="${W / 2}" y="${H - 6}" text-anchor="middle" fill="#5a6685"
+      <text x="${W / 2}" y="${H - 6}" text-anchor="middle" fill="#71717a"
         font-size="11" font-family="monospace">并发数</text>
     </svg>`;
 }
@@ -1475,7 +1676,7 @@ function ttftChart(rows) {
   const line = (pts, color, w) =>
     '<polyline points="' + pts.map(p => p.join(",")).join(" ") + '" fill="none" stroke="' + color + '" stroke-width="' + w + '" stroke-linecap="round" stroke-linejoin="round"/>';
   const dots = (pts, color) => pts.map(p =>
-    '<circle cx="' + p[0] + '" cy="' + p[1] + '" r="3.5" fill="' + color + '" stroke="#0d1220" stroke-width="1.5"/>').join("");
+    '<circle cx="' + p[0] + '" cy="' + p[1] + '" r="3.5" fill="' + color + '" stroke="#ffffff" stroke-width="1.5"/>').join("");
 
   const ttftPts = valid.map(r => [xPos(r.concurrency), yVal(r.ttft_avg || 0)]);
   const ttftP99Pts = valid.map(r => [xPos(r.concurrency), yVal(r.ttft_p99 || r.ttft_avg || 0)]);
@@ -1483,24 +1684,24 @@ function ttftChart(rows) {
   let grid = "";
   for (let i = 0; i <= 4; i++) {
     const y = padT + (plotH / 4) * i;
-    grid += '<line x1="' + padL + '" y1="' + y + '" x2="' + (W - padR) + '" y2="' + y + '" stroke="#222c44" stroke-width="1"/>';
-    grid += '<text x="' + (padL - 8) + '" y="' + (y + 4) + '" text-anchor="end" fill="#8b96b0" font-size="9" font-family="monospace">' + (maxTtft * (1 - i / 4)).toFixed(2) + 's</text>';
+    grid += '<line x1="' + padL + '" y1="' + y + '" x2="' + (W - padR) + '" y2="' + y + '" stroke="#e4e4e7" stroke-width="1"/>';
+    grid += '<text x="' + (padL - 8) + '" y="' + (y + 4) + '" text-anchor="end" fill="#71717a" font-size="9" font-family="monospace">' + (maxTtft * (1 - i / 4)).toFixed(2) + 's</text>';
   }
   let xlabels = valid.map(r =>
-    '<text x="' + xPos(r.concurrency) + '" y="' + (H - padB + 18) + '" text-anchor="middle" fill="#8b96b0" font-size="10" font-family="monospace">' + r.concurrency + '</text>').join("");
+    '<text x="' + xPos(r.concurrency) + '" y="' + (H - padB + 18) + '" text-anchor="middle" fill="#71717a" font-size="10" font-family="monospace">' + r.concurrency + '</text>').join("");
 
   return '<div class="chart-legend">'
-    + '<span class="lg"><i style="background:#f59e0b"></i>TTFT avg</span>'
-    + '<span class="lg"><i style="background:#ef4444"></i>TTFT P99</span>'
+    + '<span class="lg"><i style="background:#d97706"></i>TTFT avg</span>'
+    + '<span class="lg"><i style="background:#dc2626"></i>TTFT P99</span>'
     + '</div>'
     + '<svg viewBox="0 0 ' + W + ' ' + H + '" class="sweep-svg" xmlns="http://www.w3.org/2000/svg">'
     + grid
-    + line(ttftP99Pts, "#ef4444", 1.8)
-    + line(ttftPts, "#f59e0b", 2.4)
-    + dots(ttftP99Pts, "#ef4444")
-    + dots(ttftPts, "#f59e0b")
+    + line(ttftP99Pts, "#dc2626", 1.8)
+    + line(ttftPts, "#d97706", 2.4)
+    + dots(ttftP99Pts, "#dc2626")
+    + dots(ttftPts, "#d97706")
     + xlabels
-    + '<text x="' + (W / 2) + '" y="' + (H - 6) + '" text-anchor="middle" fill="#5a6685" font-size="11" font-family="monospace">并发数</text>'
+    + '<text x="' + (W / 2) + '" y="' + (H - 6) + '" text-anchor="middle" fill="#71717a" font-size="11" font-family="monospace">并发数</text>'
     + '</svg>';
 }
 
@@ -1524,7 +1725,7 @@ function tpsChart(rows) {
   const line = (pts, color, w) =>
     '<polyline points="' + pts.map(p => p.join(",")).join(" ") + '" fill="none" stroke="' + color + '" stroke-width="' + w + '" stroke-linecap="round" stroke-linejoin="round"/>';
   const dots = (pts, color) => pts.map(p =>
-    '<circle cx="' + p[0] + '" cy="' + p[1] + '" r="3.5" fill="' + color + '" stroke="#0d1220" stroke-width="1.5"/>').join("");
+    '<circle cx="' + p[0] + '" cy="' + p[1] + '" r="3.5" fill="' + color + '" stroke="#ffffff" stroke-width="1.5"/>').join("");
 
   const outPts = valid.map(r => [xPos(r.concurrency), yVal(r.output_tps || 0)]);
   const totalPts = hasTotal ? valid.map(r => [xPos(r.concurrency), yVal(r.total_tps || 0)]) : [];
@@ -1533,15 +1734,15 @@ function tpsChart(rows) {
   let grid = "";
   for (let i = 0; i <= 4; i++) {
     const y = padT + (plotH / 4) * i;
-    grid += '<line x1="' + padL + '" y1="' + y + '" x2="' + (W - padR) + '" y2="' + y + '" stroke="#222c44" stroke-width="1"/>';
-    grid += '<text x="' + (padL - 8) + '" y="' + (y + 4) + '" text-anchor="end" fill="#8b96b0" font-size="9" font-family="monospace">' + fmtMetric(maxTps * (1 - i / 4)) + '</text>';
+    grid += '<line x1="' + padL + '" y1="' + y + '" x2="' + (W - padR) + '" y2="' + y + '" stroke="#e4e4e7" stroke-width="1"/>';
+    grid += '<text x="' + (padL - 8) + '" y="' + (y + 4) + '" text-anchor="end" fill="#71717a" font-size="9" font-family="monospace">' + fmtMetric(maxTps * (1 - i / 4)) + '</text>';
   }
   let xlabels = valid.map(r =>
-    '<text x="' + xPos(r.concurrency) + '" y="' + (H - padB + 18) + '" text-anchor="middle" fill="#8b96b0" font-size="10" font-family="monospace">' + r.concurrency + '</text>').join("");
+    '<text x="' + xPos(r.concurrency) + '" y="' + (H - padB + 18) + '" text-anchor="middle" fill="#71717a" font-size="10" font-family="monospace">' + r.concurrency + '</text>').join("");
 
-  let legend = '<span class="lg"><i style="background:#22d3ee"></i>输出 tok/s</span>';
-  let lines = line(outPts, "#22d3ee", 2.4);
-  let dotsHtml = dots(outPts, "#22d3ee");
+  let legend = '<span class="lg"><i style="background:#4f46e5"></i>输出 tok/s</span>';
+  let lines = line(outPts, "#4f46e5", 2.4);
+  let dotsHtml = dots(outPts, "#4f46e5");
   if (hasTotal) {
     legend += '<span class="lg"><i style="background:#a78bfa"></i>总 tok/s</span>';
     lines += line(totalPts, "#a78bfa", 1.8);
@@ -1559,7 +1760,7 @@ function tpsChart(rows) {
     + lines
     + dotsHtml
     + xlabels
-    + '<text x="' + (W / 2) + '" y="' + (H - 6) + '" text-anchor="middle" fill="#5a6685" font-size="11" font-family="monospace">并发数</text>'
+    + '<text x="' + (W / 2) + '" y="' + (H - 6) + '" text-anchor="middle" fill="#71717a" font-size="11" font-family="monospace">并发数</text>'
     + '</svg>';
 }
 
@@ -1583,7 +1784,7 @@ function latencySpreadChart(rows) {
   const line = (pts, color, w, dash) =>
     '<polyline points="' + pts.map(p => p.join(",")).join(" ") + '" fill="none" stroke="' + color + '" stroke-width="' + w + '" stroke-linecap="round" stroke-linejoin="round"' + (dash ? ' stroke-dasharray="' + dash + '"' : '') + '/>';
   const dots = (pts, color) => pts.map(p =>
-    '<circle cx="' + p[0] + '" cy="' + p[1] + '" r="3" fill="' + color + '" stroke="#0d1220" stroke-width="1"/>').join("");
+    '<circle cx="' + p[0] + '" cy="' + p[1] + '" r="3" fill="' + color + '" stroke="#ffffff" stroke-width="1"/>').join("");
 
   const p50Pts = hasP50 ? valid.map(r => [xPos(r.concurrency), yVal(r.latency_p50 || 0)]) : [];
   const p90Pts = valid.map(r => [xPos(r.concurrency), yVal(r.latency_p90 || 0)]);
@@ -1593,29 +1794,29 @@ function latencySpreadChart(rows) {
   let grid = "";
   for (let i = 0; i <= 4; i++) {
     const y = padT + (plotH / 4) * i;
-    grid += '<line x1="' + padL + '" y1="' + y + '" x2="' + (W - padR) + '" y2="' + y + '" stroke="#222c44" stroke-width="1"/>';
-    grid += '<text x="' + (padL - 8) + '" y="' + (y + 4) + '" text-anchor="end" fill="#8b96b0" font-size="9" font-family="monospace">' + (maxLat * (1 - i / 4)).toFixed(2) + 's</text>';
+    grid += '<line x1="' + padL + '" y1="' + y + '" x2="' + (W - padR) + '" y2="' + y + '" stroke="#e4e4e7" stroke-width="1"/>';
+    grid += '<text x="' + (padL - 8) + '" y="' + (y + 4) + '" text-anchor="end" fill="#71717a" font-size="9" font-family="monospace">' + (maxLat * (1 - i / 4)).toFixed(2) + 's</text>';
   }
   let xlabels = valid.map(r =>
-    '<text x="' + xPos(r.concurrency) + '" y="' + (H - padB + 18) + '" text-anchor="middle" fill="#8b96b0" font-size="10" font-family="monospace">' + r.concurrency + '</text>').join("");
+    '<text x="' + xPos(r.concurrency) + '" y="' + (H - padB + 18) + '" text-anchor="middle" fill="#71717a" font-size="10" font-family="monospace">' + r.concurrency + '</text>').join("");
 
-  let legend = '<span class="lg"><i style="background:#22d3ee"></i>P50</span>'
-    + '<span class="lg"><i style="background:#6366f1"></i>P90</span>'
-    + '<span class="lg"><i style="background:#fb7185"></i>P99</span>';
+  let legend = '<span class="lg"><i style="background:#4f46e5"></i>P50</span>'
+    + '<span class="lg"><i style="background:#0d9488"></i>P90</span>'
+    + '<span class="lg"><i style="background:#18181b"></i>P99</span>';
   let lines = '';
   let dotsHtml = '';
   if (hasP50) {
-    lines += line(p50Pts, "#22d3ee", 1.5, "4,4");
-    dotsHtml += dots(p50Pts, "#22d3ee");
+    lines += line(p50Pts, "#4f46e5", 1.5, "4,4");
+    dotsHtml += dots(p50Pts, "#4f46e5");
   }
-  lines += line(p90Pts, "#6366f1", 2);
-  lines += line(p99Pts, "#fb7185", 2.4);
-  dotsHtml += dots(p90Pts, "#6366f1");
-  dotsHtml += dots(p99Pts, "#fb7185");
+  lines += line(p90Pts, "#0d9488", 2);
+  lines += line(p99Pts, "#18181b", 2.4);
+  dotsHtml += dots(p90Pts, "#0d9488");
+  dotsHtml += dots(p99Pts, "#18181b");
   if (hasMax) {
-    legend += '<span class="lg"><i style="background:#ef4444"></i>Max</span>';
-    lines += line(maxPts, "#ef4444", 1.2, "2,3");
-    dotsHtml += dots(maxPts, "#ef4444");
+    legend += '<span class="lg"><i style="background:#dc2626"></i>Max</span>';
+    lines += line(maxPts, "#dc2626", 1.2, "2,3");
+    dotsHtml += dots(maxPts, "#dc2626");
   }
 
   return '<div class="chart-legend">' + legend + '</div>'
@@ -1624,7 +1825,7 @@ function latencySpreadChart(rows) {
     + lines
     + dotsHtml
     + xlabels
-    + '<text x="' + (W / 2) + '" y="' + (H - 6) + '" text-anchor="middle" fill="#5a6685" font-size="11" font-family="monospace">并发数</text>'
+    + '<text x="' + (W / 2) + '" y="' + (H - 6) + '" text-anchor="middle" fill="#71717a" font-size="11" font-family="monospace">并发数</text>'
     + '</svg>';
 }
 
@@ -1636,9 +1837,13 @@ function scoreColor(score) {
 }
 
 function esc(s) {
-  const d = document.createElement("div");
-  d.textContent = s == null ? "" : String(s);
-  return d.innerHTML;
+  // 转义 &<> 及引号：既可用于文本内容，也可安全用于双引号属性值
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
 
 function fmtDur(sec) {
@@ -1766,21 +1971,109 @@ function applyPreset(key) {
   $("#accMaxTokens").value = p.accMaxTokens || "";
   $("#maxRetries").value = p.maxRetries;
   $("#accStream").value = p.accStream;
-  $("#presetThinking").classList.toggle("active", key === "thinking");
-  $("#presetInstruct").classList.toggle("active", key === "instruct");
+  const hint = $("#presetHint");
+  if (hint) {
+    hint.textContent = `✓ 已应用「${p.label}」预设，可继续微调`;
+    hint.className = "preset-hint active";
+  }
   document.querySelectorAll(".advanced").forEach(d => {
     if (d.querySelector("#accMaxTokens")) d.open = true;
   });
 }
-$("#presetThinking").addEventListener("click", () => applyPreset("thinking"));
-$("#presetInstruct").addEventListener("click", () => applyPreset("instruct"));
+
+$("#presetSelect").addEventListener("change", e => {
+  const key = e.target.value;
+  const hint = $("#presetHint");
+  if (!key) { if (hint) { hint.textContent = ""; hint.className = "preset-hint"; } return; }
+  applyPreset(key);
+});
+
+// 手动改动预设管理的字段时，下拉回到"不使用预设"，表示已是自定义配置
+["#timeout", "#accConcurrency", "#accMaxTokens", "#maxRetries", "#accStream", "#disableThinking"]
+  .forEach(sel => {
+    const el = $(sel);
+    if (el) el.addEventListener("change", () => {
+      if ($("#presetSelect").value) {
+        $("#presetSelect").value = "";
+        const hint = $("#presetHint");
+        if (hint) { hint.textContent = ""; hint.className = "preset-hint"; }
+      }
+    });
+  });
 const drawer = $("#historyDrawer");
 const drawerMask = $("#drawerMask");
+
+// ---- 回收站视图（软删除的任务可追溯/恢复）----
+let _trashMode = false;
+const drawerTrashBtn = document.getElementById("drawerTrashBtn");
+const drawerFiltersEl = document.querySelector(".drawer-filters");
+
+function setTrashMode(on) {
+  _trashMode = on;
+  if (drawerTrashBtn) {
+    drawerTrashBtn.classList.toggle("on", on);
+    drawerTrashBtn.textContent = on ? "↩ 返回任务" : "🗑 回收站";
+  }
+  if (drawerFiltersEl) drawerFiltersEl.style.display = on ? "none" : "";
+  if (on) loadTrashList(); else loadTaskList();
+}
+if (drawerTrashBtn) drawerTrashBtn.addEventListener("click", () => setTrashMode(!_trashMode));
+
+// 抽屉内容刷新：回收站模式刷回收站，否则刷任务列表
+function refreshDrawerList() {
+  if (_trashMode) loadTrashList(); else loadTaskList();
+}
+
+async function loadTrashList() {
+  const el = $("#taskList");
+  el.innerHTML = '<div class="skeleton skeleton-card"></div>';
+  try {
+    const r = await fetch("/api/tasks/trash");
+    const data = await r.json();
+    if (!data.tasks || !data.tasks.length) {
+      el.innerHTML = '<div class="loading-sm">回收站为空。删除的任务会保留在此，可随时恢复。</div>';
+      return;
+    }
+    el.innerHTML = "";
+    data.tasks.forEach(t => el.appendChild(trashCard(t)));
+  } catch (e) {
+    el.innerHTML = '<div class="loading-sm">加载失败</div>';
+  }
+}
+
+function trashCard(t) {
+  const card = document.createElement("div");
+  card.className = "task-card trash";
+  const fmtT = (ts) => ts ? new Date(ts * 1000).toLocaleString("zh-CN",
+    { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }) : "";
+  card.innerHTML = `
+    <div class="tc-main">
+      <div class="tc-name" title="${esc(t.name)}">${esc(t.name)}</div>
+      <div class="tc-right"><span class="tc-status stopped">回收站</span></div>
+    </div>
+    <div class="tc-meta">${esc(t.model || "")} · 创建 ${fmtT(t.created)} · 删除 ${fmtT(t.deleted_at)} · 原始状态 ${STATUS_LABEL[t.status] || t.status}</div>
+    <div class="tc-actions">
+      <button data-act="restore">恢复</button>
+      <button data-act="purge" class="act-stop">彻底删除</button>
+    </div>`;
+  card.querySelector('[data-act="restore"]').addEventListener("click", async () => {
+    const r = await fetch(`/api/tasks/${t.id}/restore`, { method: "POST" });
+    if (r.ok) { toast("已恢复任务", "success"); loadTrashList(); }
+    else toast("恢复失败", "error");
+  });
+  card.querySelector('[data-act="purge"]').addEventListener("click", async () => {
+    if (!confirm(`彻底删除「${t.name}」？此操作不可恢复。`)) return;
+    const r = await fetch(`/api/tasks/${t.id}/purge`, { method: "POST" });
+    if (r.ok) { toast("已彻底删除", "success"); loadTrashList(); }
+    else toast("删除失败", "error");
+  });
+  return card;
+}
 
 function openDrawer() {
   drawer.classList.add("open");
   drawerMask.classList.add("show");
-  loadTaskList();
+  if (_trashMode) loadTrashList(); else loadTaskList();
 }
 function closeDrawer() {
   drawer.classList.remove("open");
@@ -1885,12 +2178,15 @@ function taskCard(t) {
       summary += (summary ? " · " : "") +
         `上下文 ${t.summary.context_scan.levels} 档`;
     }
+    if (t.summary.serving && (t.summary.serving.container || t.summary.serving.label)) {
+      summary += (summary ? " · " : "") +
+        `🐳 ${t.summary.serving.container || t.summary.serving.label}`;
+    }
   }
   card.innerHTML = `
     <div class="tc-main">
       <div class="tc-name" title="${esc(t.name)}">${esc(t.name)}</div>
       <div class="tc-right">
-        ${t.status === "done" ? '<button class="tc-compare" data-act="compare" title="加入对比">⇆</button>' : ""}
         <span class="tc-status ${t.status}">${STATUS_LABEL[t.status] || t.status}</span>
       </div>
     </div>
@@ -1898,6 +2194,7 @@ function taskCard(t) {
     ${summary ? `<div class="tc-summary">${esc(summary)}</div>` : ""}
     <div class="tc-actions">
       <button data-act="view">查看</button>
+      <button data-act="copy">复制配置</button>
       ${t.status === "running" ? '<button data-act="stop" class="act-stop">停止</button>' : ""}
       ${(t.status === "stopped" || t.status === "error") ? '<button data-act="rerun">续跑</button>' : ""}
       <button data-act="rename">重命名</button>
@@ -1909,8 +2206,7 @@ function taskCard(t) {
       <button data-act="evalscope" title="${hasAccuracy ? '下载 evalscope 原始 HTML 评测报告' : '仅精度评测任务可导出 evalscope 原始报告'}">Evalscope 原始报告${hasAccuracy ? '' : ' ⊘'}</button>
     </div>${!hasAccuracy ? '<div class="tc-export-note">⚠ evalscope 原始报告仅适用于精度评测，纯性能任务请用 Excel/PDF</div>' : ''}` : ""}`;
   card.querySelector('[data-act="view"]').addEventListener("click", () => viewTask(t.id));
-  const cmpBtn = card.querySelector('[data-act="compare"]');
-  if (cmpBtn) cmpBtn.addEventListener("click", () => toggleCompare(t.id, cmpBtn));
+  card.querySelector('[data-act="copy"]').addEventListener("click", () => copyConfig(t.id));
   const stopBtn = card.querySelector('[data-act="stop"]');
   if (stopBtn) stopBtn.addEventListener("click", () => stopTaskFromDrawer(t.id, t.name));
   const xlsxBtn = card.querySelector('[data-act="xlsx"]');
@@ -1926,6 +2222,64 @@ function taskCard(t) {
   return card;
 }
 
+async function copyConfig(id) {
+  // 把历史任务的配置回填到表单，便于改两项后重跑
+  try {
+    const r = await fetch("/api/tasks/" + id);
+    const d = await r.json();
+    const c = d.config || {};
+    const set = (fid, v) => {
+      const el = $("#" + fid);
+      if (!el || v === undefined || v === null) return;
+      if (el.type === "checkbox") { el.checked = !!v; el.dispatchEvent(new Event("change")); }
+      else el.value = v;
+    };
+    set("baseUrl", c.base_url); set("model", c.model);
+    set("apiFormat", c.api_format || "openai");
+    set("servingLabel", c.serving_label || (c.serving && c.serving.label) || "");
+    set("timeout", c.timeout); set("disableThinking", c.disable_thinking);
+    set("sampleLimit", c.sample_limit); set("fewShot", c.few_shot || 0);
+    set("accConcurrency", c.acc_concurrency);
+    set("accMaxTokens", c.acc_max_tokens || ""); set("accTemperature", c.acc_temperature);
+    set("maxRetries", c.max_retries); set("accStream", String(!!c.acc_stream));
+    set("accSystem", c.acc_system || ""); set("accTemplate", c.acc_template || "");
+    // 数据集勾选
+    selectedDatasets = new Set(c.accuracy_datasets || []);
+    selectedSubjects = new Map(Object.entries(c.dataset_subjects || {})
+      .map(([k, v]) => [k, new Set(v)]));
+    await loadDatasets();
+    // 性能压测（含新版字段）
+    if (c.perf) {
+      set("runPerf", !!c.run_performance);
+      const lv = Array.isArray(c.perf.levels) ? c.perf.levels.join(",")
+               : (c.perf.sweep_levels || "");
+      set("sweepLevels", lv);
+      set("perfTotal", c.perf.requests_per_level);
+      set("perfScaleMode", (c.perf.scale_multiplier || 0) > 0);
+      set("perfScaleMult", c.perf.scale_multiplier || 10);
+      set("perfMaxTokens", c.perf.max_tokens); set("perfMinTokens", c.perf.min_tokens || 0);
+      set("perfStream", String(!!c.perf.stream));
+      set("contextLength", c.perf.context_length || 0); set("perfPrompt", c.perf.prompt || "");
+      set("perfTemperature", c.perf.temperature); set("perfSystem", c.perf.system || "");
+      set("perfTimeout", c.perf.timeout || 300); set("perfWarmup", c.perf.warmup_requests || 0);
+    }
+    // 上下文扫描
+    if (Array.isArray(c.context_lengths) && c.context_lengths.length) {
+      set("runCtxScan", true);
+      set("ctxLengths", c.context_lengths.join(","));
+      set("ctxConcurrency", c.context_concurrency || 8);
+      set("ctxRequests", c.context_requests || 20);
+      set("ctxMaxTokens", c.context_max_tokens || 256);
+      set("ctxStream", String(c.context_stream !== false));
+    }
+    closeDrawer();
+    saveForm();
+    toast("配置已复制到表单" + ((c.api_key === "***" || !c.api_key) ? "（API Key 需重新填写）" : ""), "success");
+  } catch (e) {
+    toast("复制配置失败：" + e.message, "error");
+  }
+}
+
 async function viewTask(id) {
   try {
     // 查看历史记录时，断开与实时 SSE 流的关联，避免实时日志覆盖历史数据
@@ -1936,6 +2290,8 @@ async function viewTask(id) {
     closeDrawer();
     // 渲染配置面板
     renderConfigPanel(d);
+    // 上下文横幅：正在查看历史任务，可一键返回实时
+    showViewBanner(d);
     // 回放日志
     $("#console").innerHTML = "";
     (d.logs || []).forEach(l => addLog(l.level, l.msg, l.ts));
@@ -1950,10 +2306,47 @@ async function viewTask(id) {
       d.status === "done" ? "done" : d.status === "error" ? "error" : "");
     // 切到精度结果或实时进程
     const hasAcc = d.result && d.result.accuracy && Object.keys(d.result.accuracy).length;
-    $$(".tab")[hasAcc ? 1 : 0].click();
+    const _vt = document.querySelector('[data-tab="' + (hasAcc ? 'accuracy' : 'live') + '"]');
+    if (_vt) _vt.click();
   } catch (e) {
-    alert("\u52a0\u8f7d\u4efb\u52a1\u8be6\u60c5\u5931\u8d25\uff1a" + e.message);
+    toast("\u52a0\u8f7d\u4efb\u52a1\u8be6\u60c5\u5931\u8d25\uff1a" + e.message, "info");
   }
+}
+
+// ---- 历史任务查看横幅：标明当前视图上下文，可一键返回实时进程 ----
+function showViewBanner(d) {
+  const pane = document.getElementById("pane-live");
+  const con = document.getElementById("console");
+  if (!pane || !con) return;
+  let b = document.getElementById("viewBanner");
+  if (!b) {
+    b = document.createElement("div");
+    b.id = "viewBanner";
+    b.className = "view-banner";
+    pane.insertBefore(b, con);
+    b.addEventListener("click", e => {
+      if (e.target.closest("#viewBannerBack")) { b.remove(); switchLiveBack(); }
+      else if (e.target.closest("#viewBannerClose")) b.remove();
+    });
+  }
+  b.innerHTML = `<span class="vb-icon">👁</span><span class="vb-text">正在查看历史任务：<b>${esc(d.name || d.id)}</b>（${STATUS_LABEL[d.status] || d.status}）</span><button id="viewBannerBack">返回实时进程</button><button id="viewBannerClose" title="关闭">✕</button>`;
+}
+
+function switchLiveBack() {
+  const running = Object.entries(_taskStreams).filter(([, s]) => !s.done);
+  if (running.length) {
+    connectStream(running[0][0]);
+    switchLiveTask(running[0][0]);
+    return;
+  }
+  // 无运行任务：清空历史视图，回到实时空态
+  currentTaskId = null;
+  $("#console").innerHTML = '<div class="console-empty">配置模型与测试项后，点击「开始测评」。日志将在此实时显示。</div>';
+  $("#accResults").innerHTML = ""; $("#perfResults").innerHTML = ""; $("#ctxResults").innerHTML = "";
+  $("#accEmpty").style.display = "block"; $("#perfEmpty").style.display = "block"; $("#ctxEmpty").style.display = "block";
+  const _t = document.querySelector('[data-tab="live"]');
+  if (_t) _t.click();
+  setStatus("就绪", "");
 }
 
 function renderConfigPanel(d) {
@@ -1978,6 +2371,8 @@ function renderConfigPanel(d) {
   const perfEnabled = cfg.run_performance || false;
   const pc = cfg.perf || {};
   const ctxEnabled = (cfg.context_lengths || []).length > 0;
+  const serving = cfg.serving || {};
+  const modelsStr = (serving.models || []).join(", ");
   const duration = d.duration != null
     ? (d.duration < 60 ? `${d.duration}s` : d.duration < 3600
       ? `${Math.floor(d.duration/60)}m${Math.floor(d.duration%60)}s`
@@ -1989,16 +2384,26 @@ function renderConfigPanel(d) {
       <div class="cfg-row"><span class="cfg-k">模型</span><span class="cfg-v">${esc(cfg.model || "-")}</span></div>
       <div class="cfg-row"><span class="cfg-k">接口地址</span><span class="cfg-v mono">${esc((cfg.base_url || "").substring(0,60))}</span></div>
       <div class="cfg-row"><span class="cfg-k">接口格式</span><span class="cfg-v">${esc(cfg.api_format || "-")}</span></div>
+      <div class="cfg-row"><span class="cfg-k">请求超时</span><span class="cfg-v">${cfg.timeout ?? "-"}s</span></div>
       <div class="cfg-row"><span class="cfg-k">关闭思考</span><span class="cfg-v">${cfg.disable_thinking ? "是" : "否"}</span></div>
       <div class="cfg-row"><span class="cfg-k">运行时长</span><span class="cfg-v">${duration}</span></div>
+      ${serving.container || serving.label ? `<div class="cfg-row"><span class="cfg-k">🐳 服务容器</span><span class="cfg-v mono">${esc(serving.container || serving.label || "-")}${serving.image ? ` (${esc(serving.image)})` : ""}${serving.ambiguous ? " · ⚠ 同端口多容器" : ""}</span></div>` : ""}
+      ${modelsStr ? `<div class="cfg-row"><span class="cfg-k">目标模型列表</span><span class="cfg-v mono">${esc(modelsStr)}</span></div>` : ""}
       <div class="cfg-row"><span class="cfg-k">精度数据集</span><span class="cfg-v">${dsTags || "无"}</span></div>
       ${subjStr ? `<div class="cfg-row"><span class="cfg-k">学科筛选</span><span class="cfg-v">${subjStr}</span></div>` : ""}
       <div class="cfg-row"><span class="cfg-k">Few-shot</span><span class="cfg-v">${cfg.few_shot ?? 0}</span></div>
       <div class="cfg-row"><span class="cfg-k">Sample limit</span><span class="cfg-v">${cfg.sample_limit || "全量"}</span></div>
       <div class="cfg-row"><span class="cfg-k">精度 max_tokens</span><span class="cfg-v">${cfg.acc_max_tokens || "自动"}</span></div>
-      <div class="cfg-row"><span class="cfg-k">温度</span><span class="cfg-v">${cfg.acc_temperature ?? 0}</span></div>
-      ${perfEnabled ? `<div class="cfg-row"><span class="cfg-k">性能压测</span><span class="cfg-v">并发 ${(pc.levels||[]).join(",") || "-"} · ${pc.requests_per_level||"-"} 请求/档 · max_tokens ${pc.max_tokens||"-"} · ${pc.stream ? "流式" : "非流式"}${pc.context_length ? " · 上下文 "+pc.context_length+" tok" : ""}</span></div>` : ""}
-      ${ctxEnabled ? `<div class="cfg-row"><span class="cfg-k">上下文扫描</span><span class="cfg-v">${(cfg.context_lengths||[]).join(", ")} tokens · 并发 ${cfg.context_concurrency||"-"}</span></div>` : ""}
+      <div class="cfg-row"><span class="cfg-k">精度温度</span><span class="cfg-v">${cfg.acc_temperature ?? 0}</span></div>
+      <div class="cfg-row"><span class="cfg-k">评测并发</span><span class="cfg-v">${cfg.acc_concurrency ?? "-"}</span></div>
+      <div class="cfg-row"><span class="cfg-k">评测模式</span><span class="cfg-v">${cfg.acc_stream ? "流式" : "非流式"}</span></div>
+      <div class="cfg-row"><span class="cfg-k">失败重试</span><span class="cfg-v">${cfg.max_retries ?? "-"} 次</span></div>
+      ${cfg.acc_system ? `<div class="cfg-row"><span class="cfg-k">System Prompt</span><span class="cfg-v">${esc(cfg.acc_system.substring(0, 80))}</span></div>` : ""}
+      ${cfg.acc_template ? `<div class="cfg-row"><span class="cfg-k">答题模板</span><span class="cfg-v">${esc(cfg.acc_template.substring(0, 80))}</span></div>` : ""}
+      ${perfEnabled ? `<div class="cfg-row"><span class="cfg-k">性能并发档</span><span class="cfg-v">${(pc.levels||[]).join(",") || "-"} · ${pc.requests_per_level||"-"} 请求/档</span></div>
+      <div class="cfg-row"><span class="cfg-k">性能参数</span><span class="cfg-v">max_tokens ${pc.max_tokens||"-"}${pc.min_tokens ? " · min_tokens "+pc.min_tokens : ""} · ${pc.stream ? "流式" : "非流式"} · 超时 ${pc.timeout||"-"}s${pc.warmup_requests ? " · 预热 "+pc.warmup_requests : ""}${pc.context_length ? " · 长上下文 "+pc.context_length+" tok" : ""}</span></div>
+      ${pc.prompt ? `<div class="cfg-row"><span class="cfg-k">压测提示词</span><span class="cfg-v">${esc(pc.prompt.substring(0, 60))}</span></div>` : ""}` : ""}
+      ${ctxEnabled ? `<div class="cfg-row"><span class="cfg-k">上下文扫描</span><span class="cfg-v">${(cfg.context_lengths||[]).join(", ")} tokens · 并发 ${cfg.context_concurrency||"-"} · ${cfg.context_requests||"-"} 请求/档 · max_tokens ${cfg.context_max_tokens||"-"} · ${cfg.context_stream !== false ? "流式" : "非流式"}</span></div>` : ""}
     </div>
   </details>`;
 }
@@ -2011,9 +2416,9 @@ async function exportReport(id, fmt) {
       const e = await r.json().catch(() => ({}));
       const msg = e.detail || r.status;
       if (fmt === "evalscope") {
-        alert("无法导出 evalscope 原始报告\n\n" + msg + "\n\n说明：evalscope 原始 HTML 报告仅由精度评测（eval）生成。\n纯性能压测（perf）请使用 Excel 或 PDF 导出。");
+        toast("无法导出 evalscope 原始报告\n\n" + msg + "\n\n说明：evalscope 原始 HTML 报告仅由精度评测（eval）生成。\n纯性能压测（perf）请使用 Excel 或 PDF 导出。", "error");
       } else {
-        alert("导出失败：" + msg);
+        toast("导出失败：" + msg, "error");
       }
       return;
     }
@@ -2026,7 +2431,7 @@ async function exportReport(id, fmt) {
     document.body.appendChild(a); a.click(); a.remove();
     URL.revokeObjectURL(a.href);
   } catch (e) {
-    alert("导出失败：" + e.message);
+    toast("导出失败：" + e.message, "error");
   }
 }
 
@@ -2034,9 +2439,9 @@ async function stopTaskFromDrawer(id, name) {
   if (!confirm(`确定停止任务「${name}」？已完成的进度会保存，可稍后续跑。`)) return;
   try {
     await fetch(`/api/tasks/${id}/stop`, { method: "POST" });
-    loadTaskList();
+    refreshDrawerList();
   } catch (e) {
-    alert("停止失败：" + e.message);
+    toast("停止失败：" + e.message, "error");
   }
 }
 
@@ -2069,7 +2474,7 @@ async function rerunTask(id) {
     document.getElementById("rerunMask").classList.add("show");
     document.getElementById("rerunModal").classList.add("open");
   } catch (e) {
-    alert("加载任务配置失败：" + e.message);
+    toast("加载任务配置失败：" + e.message, "error");
   }
 }
 
@@ -2082,7 +2487,7 @@ async function doRerun() {
       body: JSON.stringify({ api_key: apiKey }),
     });
     const data = await r.json();
-    if (!r.ok) { alert("续跑失败：" + (data.detail || "")); return; }
+    if (!r.ok) { toast("续跑失败：" + (data.detail || ""), "error");return; }
     closeRerunModal();
     closeDrawer();
     $("#console").innerHTML = "";
@@ -2094,14 +2499,15 @@ async function doRerun() {
     $("#ctxEmpty").style.display = "block";
     $("#btnStart").style.display = "none"; $("#btnStop").style.display = "block";
     setStatus("运行中", "running");
-    $$(".tab")[0].click();
+    const _rt = document.querySelector('[data-tab="live"]');
+    if (_rt) _rt.click();
     currentTaskId = data.task_id;
     addLog("info", "从断点续跑任务…");
     const st2 = _ensureStream(currentTaskId);
     st2.config = { model: data.name || currentTaskId };
     switchLiveTask(currentTaskId);
   } catch (e) {
-    alert("续跑失败：" + e.message);
+    toast("续跑失败：" + e.message, "error");
   }
 }
 
@@ -2122,168 +2528,27 @@ async function renameTask(id, oldName) {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name: name.trim() }),
   });
-  loadTaskList();
+  refreshDrawerList();
 }
 
 async function delTask(id, name) {
-  if (!confirm(`确定删除任务「${name}」？此操作不可恢复。`)) return;
-  await fetch("/api/tasks/" + id, { method: "DELETE" });
-  loadTaskList();
+  if (!confirm(`确定删除任务「${name}」？可在 5 秒内撤销，也可稍后在回收站恢复。`)) return;
+  try {
+    const r = await fetch("/api/tasks/" + id, { method: "DELETE" });
+    if (!r.ok) { toast("删除失败", "error"); return; }
+    refreshDrawerList();
+    toast(`已删除「${name}」`, "success", 5000, "撤销", async () => {
+      const rr = await fetch(`/api/tasks/${id}/restore`, { method: "POST" });
+      if (rr.ok) { toast("已恢复任务", "success"); refreshDrawerList(); }
+      else toast("恢复失败", "error");
+    });
+  } catch (e) {
+    toast("删除失败：" + e.message, "error");
+  }
 }
 
 
 // ============ 任务对比 ============
-let _compareIds = new Set();
-
-function toggleCompare(id, btn) {
-  if (_compareIds.has(id)) {
-    _compareIds.delete(id);
-    btn.classList.remove("on");
-  } else {
-    if (_compareIds.size >= 4) {
-      alert("最多同时对比 4 个任务");
-      return;
-    }
-    _compareIds.add(id);
-    btn.classList.add("on");
-  }
-  updateCompareBar();
-}
-
-function updateCompareBar() {
-  let bar = document.getElementById("compareBar");
-  if (!bar && _compareIds.size >= 2) {
-    bar = document.createElement("div");
-    bar.id = "compareBar";
-    bar.className = "compare-bar";
-    bar.innerHTML = '<span class="compare-label">已选 ' + _compareIds.size + ' 个任务</span>'
-      + '<button id="compareGo">对比</button>'
-      + '<button id="compareClear">清空</button>';
-    document.getElementById("historyDrawer").appendChild(bar);
-    document.getElementById("compareGo").addEventListener("click", doCompare);
-    document.getElementById("compareClear").addEventListener("click", () => {
-      _compareIds.clear();
-      document.querySelectorAll(".tc-compare.on").forEach(b => b.classList.remove("on"));
-      const b = document.getElementById("compareBar");
-      if (b) b.remove();
-    });
-  }
-  if (bar) {
-    if (_compareIds.size < 2) {
-      bar.remove();
-    } else {
-      bar.querySelector(".compare-label").textContent = "已选 " + _compareIds.size + " 个任务";
-    }
-  }
-}
-
-async function doCompare() {
-  const ids = [..._compareIds];
-  closeDrawer();
-  // Load all tasks
-  const tasks = [];
-  for (const id of ids) {
-    try {
-      const r = await fetch("/api/tasks/" + id);
-      const d = await r.json();
-      tasks.push(d);
-    } catch (e) {}
-  }
-  if (tasks.length < 2) { alert("至少需要 2 个有效任务"); return; }
-
-  // Build comparison table
-  $("#console").innerHTML = "";
-  $("#progressOverview").innerHTML = "";
-  $("#accResults").innerHTML = "";
-  $("#perfResults").innerHTML = "";
-  $("#ctxResults").innerHTML = "";
-
-  // Accuracy comparison
-  let allDs = new Set();
-  tasks.forEach(t => {
-    const acc = (t.result && t.result.accuracy) || {};
-    Object.keys(acc).forEach(k => allDs.add(k));
-  });
-
-  let accHtml = "";
-  if (allDs.size > 0) {
-    accHtml = '<div class="result-block"><h3>精度对比</h3><div class="table-scroll"><table><thead><tr><th>数据集</th>'
-      + tasks.map((t, i) => `<th class="cmp-col cmp-col-${i}">${esc((t.name||"").substring(0,15))}</th>`).join("")
-      + '</tr></thead><tbody>';
-    for (const ds of [...allDs].sort()) {
-      accHtml += '<tr><td>' + esc(ds) + '</td>';
-      let best = -1, bestVal = -1;
-      tasks.forEach(t => {
-        const v = ((t.result && t.result.accuracy || {})[ds] || {}).accuracy;
-        if (v != null && v > bestVal) { bestVal = v; best = tasks.indexOf(t); }
-      });
-      tasks.forEach((t, i) => {
-        const v = ((t.result && t.result.accuracy || {})[ds] || {}).accuracy;
-        const cls = (i === best && v != null) ? "best-val" : "";
-        accHtml += '<td class="' + cls + '">' + (v != null ? v + "%" : "-") + '</td>';
-      });
-      accHtml += '</tr>';
-    }
-    accHtml += '</tbody></table></div></div>';
-    $("#accResults").innerHTML = accHtml;
-    $("#accEmpty").style.display = "none";
-  }
-
-  // Perf comparison
-  let allPerf = tasks.some(t => {
-    const p = (t.result && t.result.performance) || {};
-    return p.best || (p.sweep && p.sweep.length);
-  });
-  if (allPerf) {
-    let perfHtml = '<div class="result-block"><h3>性能对比</h3><div class="table-scroll"><table><thead><tr><th>指标</th>'
-      + tasks.map((t, i) => `<th class="cmp-col cmp-col-${i}">${esc((t.name||"").substring(0,15))}</th>`).join("")
-      + '</tr></thead><tbody>';
-    const metrics = [
-      ["最高 RPS", t => ((t.result||{}).performance||{}).best||{}],
-      ["P99 延迟", t => {
-        const s = (((t.result||{}).performance||{}).sweep||[]);
-        const best = (((t.result||{}).performance||{}).best||{});
-        if (!s.length) return null;
-        const r = s.find(r => r.concurrency === best.concurrency) || s[0];
-        return r.latency_p99;
-      }],
-      ["TTFT", t => {
-        const s = (((t.result||{}).performance||{}).sweep||[]);
-        if (!s.length) return null;
-        const best = (((t.result||{}).performance||{}).best||{});
-        const r = s.find(r => r.concurrency === best.concurrency) || s[0];
-        return r.ttft_avg;
-      }],
-    ];
-    metrics.forEach(([label, fn]) => {
-      let best = -1, bestIdx = -1;
-      const vals = tasks.map((t, i) => {
-        const r = fn(t);
-        if (typeof r === "object") r = r.rps;
-        if (r != null && r > best) { best = r; bestIdx = i; }
-        return r;
-      });
-      perfHtml += '<tr><td>' + label + '</td>';
-      vals.forEach((v, i) => {
-        const cls = i === bestIdx ? "best-val" : "";
-        const display = v != null ? (typeof v === "number" ? fmtMetric(v) + (label.includes("P99") ? "s" : label.includes("TTFT") ? "s" : "") : String(v)) : "-";
-        perfHtml += '<td class="' + cls + '">' + display + '</td>';
-      });
-      perfHtml += '</tr>';
-    });
-    perfHtml += '</tbody></table></div></div>';
-    $("#perfResults").innerHTML = perfHtml;
-    $("#perfEmpty").style.display = "none";
-  }
-
-  setStatus("对比模式", "done");
-  $$(".tab")[1].click();
-  _compareIds.clear();
-  document.querySelectorAll(".tc-compare.on").forEach(b => b.classList.remove("on"));
-  const b = document.getElementById("compareBar");
-  if (b) b.remove();
-}
-
 // ============ 答题详情查看器 ============
 let _reviewTaskId = null;
 let _reviewDataset = null;
@@ -2298,7 +2563,7 @@ document.addEventListener("click", (e) => {
   // Find current task ID from the config panel or from viewed task
   if (!_reviewTaskId) {
     // Try to get task ID from the currently viewed task detail
-    alert("请先从历史任务中查看任务详情");
+    toast("请先从历史任务中查看任务详情", "warn");
     return;
   }
   openReviewModal(_reviewTaskId, ds);
@@ -2429,3 +2694,359 @@ function renderSamples(data) {
   document.getElementById("reviewPrev").disabled = data.page <= 1;
   document.getElementById("reviewNext").disabled = !data.has_more;
 }
+
+// ============ 表单记忆（localStorage）：刷新/重开自动回填上次配置 ============
+// 注意：apiKey 不纳入持久化，避免明文密钥留在 localStorage
+const FORM_FIELDS = ["baseUrl","model","apiFormat","servingLabel","timeout","disableThinking",
+  "accConcurrency","accMaxTokens","accTemperature","maxRetries","accStream","fewShot",
+  "accSystem","accTemplate","sampleLimit","runPerf","sweepLevels","perfTotal",
+  "perfScaleMode","perfScaleMult","perfMaxTokens","perfMinTokens","perfStream",
+  "contextLength","perfPrompt","perfTemperature","perfSystem","perfTimeout","perfWarmup",
+  "runCtxScan","ctxLengths","ctxConcurrency","ctxRequests","ctxMaxTokens","ctxStream"];
+const LS_KEY = "evalbench_form_v1";
+function saveForm() {
+  const data = {};
+  FORM_FIELDS.forEach(id => {
+    const el = $("#" + id);
+    if (el) data[id] = el.type === "checkbox" ? el.checked : el.value;
+  });
+  try { localStorage.setItem(LS_KEY, JSON.stringify(data)); } catch (e) {}
+}
+function loadForm() {
+  let data = {};
+  try { data = JSON.parse(localStorage.getItem(LS_KEY) || "{}"); } catch (e) {}
+  if ("apiKey" in data) {  // 清理旧版本遗留的明文 apiKey
+    delete data.apiKey;
+    try { localStorage.setItem(LS_KEY, JSON.stringify(data)); } catch (e) {}
+  }
+  FORM_FIELDS.forEach(id => {
+    if (!(id in data)) return;
+    const el = $("#" + id);
+    if (!el) return;
+    if (el.type === "checkbox") { el.checked = !!data[id]; el.dispatchEvent(new Event("change")); }
+    else el.value = data[id];
+  });
+}
+FORM_FIELDS.forEach(id => {
+  const el = $("#" + id);
+  if (el) { el.addEventListener("input", saveForm); el.addEventListener("change", saveForm); }
+});
+loadForm();
+
+// ============ 刷新页面后自动重连运行中的任务（多任务） ============
+async function resumeRunningTasks() {
+  try {
+    const r = await fetch("/api/tasks");
+    const data = await r.json();
+    const running = (data.tasks || []).filter(t => t.status === "running");
+    if (!running.length) return;
+    for (const t of running) {
+      try {
+        const dr = await fetch("/api/tasks/" + t.id);
+        const d = await dr.json();
+        const st = _ensureStream(t.id);
+        st.config = d.config || null;
+        (d.logs || []).forEach(l => {
+          if (l.level) st.logs.push({ level: l.level, msg: l.msg, ts: l.ts });
+        });
+        if (d.sweep_levels) st.sweepRows = d.sweep_levels.map(e => e.row);
+      } catch (e) { /* 单个任务失败不影响其他 */ }
+    }
+    connectStream(running[0].id);
+    addLog("info", `页面刷新，已重新连接 ${running.length} 个运行中的任务`);
+    _renderTaskSwitcher();
+  } catch (e) { /* 忽略，按无任务处理 */ }
+}
+resumeRunningTasks();
+
+// ─────────── 模型档案：配置持久化（服务端 /app/data/profiles.json） ───────────
+async function loadProfiles(selectName) {
+  try {
+    const r = await fetch("/api/profiles");
+    const d = await r.json();
+    window._profiles = d.profiles || {};
+    const sel = $("#profileSelect");
+    if (!sel) return;
+    sel.innerHTML = '<option value="">不使用档案（手动配置）</option>';
+    Object.keys(window._profiles).sort().forEach(n => {
+      const o = document.createElement("option");
+      o.value = n; o.textContent = n;
+      sel.appendChild(o);
+    });
+    if (selectName && window._profiles[selectName]) sel.value = selectName;
+    renderBatchList();
+  } catch (e) { /* 档案服务不可用不影响主流程 */ }
+}
+
+function applyProfile(name) {
+  const p = (window._profiles || {})[name];
+  if (!p) return;
+  const set = (id, v) => { if (v === undefined || v === null) return; const el = $("#" + id); if (el) el.value = v; };
+  set("baseUrl", p.base_url);
+  set("apiKey", p.api_key);
+  set("model", p.model);
+  set("apiFormat", p.api_format || "openai");
+  set("timeout", p.timeout || 120);
+  set("accConcurrency", p.acc_concurrency);
+  set("accMaxTokens", p.acc_max_tokens || "");
+  set("accTemperature", p.acc_temperature);
+  set("accStream", p.acc_stream ? "true" : "false");
+  $("#disableThinking").checked = !!p.disable_thinking;
+  const hint = $("#presetHint");
+  if (hint) { hint.textContent = `已载入档案「${name}」`; hint.classList.add("active"); }
+}
+
+async function saveProfile() {
+  const defName = $("#model").value.trim();
+  const name = (prompt("保存为模型档案（同名覆盖）：", defName) || "").trim();
+  if (!name) return;
+  const cfg = {
+    base_url: $("#baseUrl").value.trim(),
+    api_key: $("#apiKey").value.trim(),
+    model: $("#model").value.trim(),
+    api_format: $("#apiFormat").value,
+    timeout: parseFloat($("#timeout").value) || 120,
+    disable_thinking: $("#disableThinking").checked,
+    acc_concurrency: parseInt($("#accConcurrency").value) || 4,
+    acc_max_tokens: parseInt($("#accMaxTokens").value) || 0,
+    acc_temperature: parseFloat($("#accTemperature").value) || 0,
+    acc_stream: $("#accStream").value === "true",
+  };
+  try {
+    const r = await fetch("/api/profiles", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, config: cfg }),
+    });
+    const d = await r.json();
+    if (!r.ok) { toast("保存失败：" + (d.detail || r.status), "error");return; }
+    await loadProfiles(name);
+    const hint = $("#presetHint");
+    if (hint) { hint.textContent = `档案「${name}」已保存`; hint.classList.add("active"); }
+  } catch (e) { toast("保存失败：" + e, "error"); }
+}
+
+async function deleteProfile() {
+  const name = $("#profileSelect").value;
+  if (!name) return;
+  if (!confirm(`删除模型档案「${name}」？`)) return;
+  try {
+    await fetch("/api/profiles/" + encodeURIComponent(name), { method: "DELETE" });
+    await loadProfiles();
+  } catch (e) { /* 忽略 */ }
+}
+
+$("#profileSelect").addEventListener("change", (e) => {
+  if (e.target.value) applyProfile(e.target.value);
+});
+$("#btnProfileSave").addEventListener("click", saveProfile);
+$("#btnProfileDel").addEventListener("click", deleteProfile);
+loadProfiles();
+
+// ─────────── 成绩单：模型 × 数据集 分数矩阵 ───────────
+async function loadBoard() {
+  const body = $("#boardBody");
+  if (!body) return;
+  try {
+    const r = await fetch("/api/leaderboard");
+    const d = await r.json();
+    renderBoard(d);
+  } catch (e) {
+    body.innerHTML = '<div class="empty-state">成绩单加载失败</div>';
+  }
+}
+
+function renderBoard(d) {
+  const body = $("#boardBody");
+  const models = d.models || [], datasets = d.datasets || [], cells = d.cells || {};
+  if (!models.length || !datasets.length) {
+    body.innerHTML = '<div class="empty-state">还没有已完成的评测任务，跑一个试试。</div>';
+    return;
+  }
+  // 每列最佳分（用于高亮；单模型列不高亮）
+  const best = {};
+  datasets.forEach(ds => {
+    let b = -1, cnt = 0;
+    models.forEach(m => {
+      const c = cells[m + "|" + ds];
+      if (c) { cnt++; if (c.score > b) b = c.score; }
+    });
+    best[ds] = { score: b, multi: cnt > 1 };
+  });
+  let html = '<div class="table-scroll"><table class="board-table"><thead><tr><th>模型</th>';
+  datasets.forEach(ds => { html += `<th>${esc(ds)}</th>`; });
+  html += "</tr></thead><tbody>";
+  models.forEach(m => {
+    html += `<tr><td class="board-model">${esc(m)}</td>`;
+    datasets.forEach(ds => {
+      const c = cells[m + "|" + ds];
+      if (!c) { html += '<td class="board-empty">—</td>'; return; }
+      const isBest = best[ds].multi && c.score >= best[ds].score;
+      let delta = "";
+      if (c.prev !== null && c.prev !== undefined) {
+        const diff = +(c.score - c.prev).toFixed(2);
+        if (diff > 0) delta = `<span class="bd-up">▲${diff}</span>`;
+        else if (diff < 0) delta = `<span class="bd-down">▼${Math.abs(diff)}</span>`;
+        else delta = '<span class="bd-flat">=</span>';
+      }
+      const dt = c.finished_at ? new Date(c.finished_at * 1000) : null;
+      const dstr = dt ? `${dt.getMonth() + 1}/${dt.getDate()}` : "";
+      html += `<td class="board-cell${isBest ? " best" : ""}" data-task="${c.task_id}"` +
+        ` title="${esc(c.task_name || "")}&#10;${dstr} · ${c.n} 样本 · 累计 ${c.runs} 次评测&#10;点击查看任务">` +
+        `<div class="bd-score">${c.score}</div>` +
+        `<div class="bd-meta">${delta}<span class="bd-n">n=${c.n}</span></div></td>`;
+    });
+    html += "</tr>";
+  });
+  html += "</tbody></table></div>";
+  body.innerHTML = html;
+  body.querySelectorAll(".board-cell").forEach(td => {
+    td.addEventListener("click", () => {
+      if (td.dataset.task) viewTask(td.dataset.task);
+    });
+  });
+}
+
+const _boardTab = document.querySelector('[data-tab="board"]');
+if (_boardTab) _boardTab.addEventListener("click", loadBoard);
+const _btnBoardRefresh = $("#btnBoardRefresh");
+if (_btnBoardRefresh) _btnBoardRefresh.addEventListener("click", loadBoard);
+loadBoard();
+
+// ─────────── 批量评测：多模型 × 同一套评测配置 ───────────
+window._batchModels = window._batchModels || new Set();
+
+function renderBatchList() {
+  const list = $("#batchList");
+  if (!list) return;
+  const names = Object.keys(window._profiles || {}).sort();
+  // 清理已删除档案的勾选
+  [...window._batchModels].forEach(n => { if (!names.includes(n)) window._batchModels.delete(n); });
+  const hint = $("#batchHint");
+  if (hint) hint.style.display = window._batchModels.size ? "block" : "none";
+  if (!names.length) {
+    list.innerHTML = '<span class="batch-empty">暂无档案，先在上方保存模型档案</span>';
+    return;
+  }
+  list.innerHTML = "";
+  names.forEach(n => {
+    const chip = document.createElement("span");
+    chip.className = "batch-chip" + (window._batchModels.has(n) ? " on" : "");
+    chip.textContent = n;
+    chip.title = "点击勾选/取消";
+    chip.addEventListener("click", () => {
+      if (window._batchModels.has(n)) window._batchModels.delete(n);
+      else window._batchModels.add(n);
+      chip.classList.toggle("on");
+      if (hint) hint.style.display = window._batchModels.size ? "block" : "none";
+    });
+    list.appendChild(chip);
+  });
+}
+
+async function batchStart(cfg) {
+  if (cfg.accuracy_datasets.length === 0 && !cfg.run_performance && cfg.context_lengths.length === 0) {
+    toast("请至少选择一个精度数据集、性能压测或上下文扫描", "warn");return;
+  }
+  const names = [...window._batchModels];
+  if (!names.length) return;
+  const now = new Date();
+  const ts = `${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")} ${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+  const results = [];
+  for (const n of names) {
+    const p = (window._profiles || {})[n];
+    if (!p) { results.push({ n, ok: false, err: "档案不存在" }); continue; }
+    const c = Object.assign({}, cfg, {
+      base_url: p.base_url || "",
+      api_key: p.api_key || "",
+      model: p.model || "",
+      api_format: p.api_format || "openai",
+      timeout: p.timeout || cfg.timeout,
+      disable_thinking: !!p.disable_thinking,
+      task_name: `${p.model || n} · 批量 · ${ts}`,
+    });
+    if (!c.base_url) { results.push({ n, ok: false, err: "档案缺少 base_url" }); continue; }
+    if (!["openai", "vllm", "anthropic"].includes(c.api_format)) {
+      results.push({ n, ok: false, err: "接口格式不支持正式评测" }); continue;
+    }
+    try {
+      const r = await fetch("/api/start", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(c),
+      });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.detail || "启动失败");
+      results.push({ n, ok: true, id: d.task_id, pos: d.queue_position });
+    } catch (e) {
+      results.push({ n, ok: false, err: String(e.message || e) });
+    }
+  }
+  // 汇总反馈
+  const oks = results.filter(r => r.ok);
+  const fails = results.filter(r => !r.ok);
+  $("#console").innerHTML = "";
+  addLog("info", `批量评测：已提交 ${oks.length}/${results.length} 个任务（队列最多同时跑 3 个）`);
+  oks.forEach(r => addLog("success", `✔ ${r.n} → 任务 ${r.id}${r.pos > 0 ? `（排队 #${r.pos}）` : "（已启动）"}`));
+  fails.forEach(r => addLog("error", `✘ ${r.n} → ${r.err}`));
+  if (oks.length) {
+    setStatus("运行中", "running");
+    currentTaskId = oks[0].id;
+    const st = _ensureStream(currentTaskId);
+    st.config = cfg;
+    switchLiveTask(currentTaskId);
+    const lt = document.querySelector('[data-tab="live"]');
+    if (lt) lt.click();
+    // 任务跑完后成绩单可见：自动刷新一次
+    setTimeout(loadBoard, 5000);
+  }
+}
+
+// ─────────── Toast 通知（替代 alert） ───────────
+function toast(msg, type = "info", ms = 4200, actionLabel = null, actionFn = null) {
+  let wrap = $("#toastWrap");
+  if (!wrap) {
+    wrap = document.createElement("div");
+    wrap.id = "toastWrap";
+    wrap.className = "toast-wrap";
+    document.body.appendChild(wrap);
+  }
+  const icons = { info: "ℹ", success: "✓", warn: "⚠", error: "✕" };
+  const el = document.createElement("div");
+  el.className = `toast ${type}`;
+  el.innerHTML = `<span class="t-ico">${icons[type] || icons.info}</span><span class="t-msg"></span>${actionLabel ? '<button class="t-act"></button>' : ""}<button class="t-close" title="关闭">✕</button>`;
+  el.querySelector(".t-msg").textContent = msg;
+  if (actionLabel) {
+    const a = el.querySelector(".t-act");
+    a.textContent = actionLabel;
+    a.addEventListener("click", () => { dismiss(); if (actionFn) actionFn(); });
+  }
+  el.querySelector(".t-close").addEventListener("click", () => dismiss());
+  wrap.appendChild(el);
+  let dismissed = false;
+  function dismiss() {
+    if (dismissed) return;
+    dismissed = true;
+    el.classList.add("out");
+    setTimeout(() => el.remove(), 260);
+  }
+  if (ms > 0) setTimeout(dismiss, ms);
+  return dismiss;
+}
+
+// ─────────── 任务完成标题闪烁提醒 ───────────
+const _origTitle = document.title;
+let _titleTimer = null;
+function flashTitle(msg) {
+  if (!document.hidden) return;   // 页面在前台则不打扰
+  stopFlashTitle();
+  let on = false;
+  _titleTimer = setInterval(() => {
+    document.title = on ? _origTitle : msg;
+    on = !on;
+  }, 1200);
+}
+function stopFlashTitle() {
+  if (_titleTimer) { clearInterval(_titleTimer); _titleTimer = null; }
+  if (document.title !== _origTitle) document.title = _origTitle;
+}
+document.addEventListener("visibilitychange", () => { if (!document.hidden) stopFlashTitle(); });
+
